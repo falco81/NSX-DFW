@@ -10,12 +10,13 @@ A Python toolkit for analyzing VMware NSX-T Distributed Firewall (DFW) logs. Con
 
 NSX-T DFW log exports from Log Insight can contain **tens of millions** of raw syslog rows spread across dozens of CSV files packed in a tar.gz archive. Manually sifting through these to identify unique flows, blocked traffic, or suspicious connections is impractical. You need a way to deduplicate, filter, enrich (DNS PTR, service names), and visualize the data — ideally without uploading anything to external services.
 
-This toolkit solves that with two scripts:
+This toolkit solves that with three scripts:
 
 | Script | Purpose |
 |---|---|
 | `nsxt_fw_analyzer.py` | Main analyzer — extract, deduplicate, filter, and report DFW flows |
 | `dns_cache_update.py` | Helper — bulk DNS PTR cache management, pre-population, and maintenance |
+| `nsx_dfw_doc.py` | DFW documentation — fetch policies/rules/groups from NSX API and generate interactive HTML reference |
 
 ## Features
 
@@ -51,6 +52,7 @@ pip install dnspython
 nsxt-fw-analyzer/
 ├── nsxt_fw_analyzer.py      # Main analyzer script
 ├── dns_cache_update.py      # DNS cache management helper
+├── nsx_dfw_doc.py           # DFW documentation generator
 ├── .dns_ptr_cache.json      # Auto-generated DNS cache (gitignored)
 ├── services-db.csv          # Optional IANA port database (--download-services)
 ├── geoip-country.csv        # Optional GeoIP country database (--download-geoip)
@@ -513,9 +515,213 @@ python3 dns_cache_update.py --remove-empty
 
 ---
 
+# nsx_dfw_doc.py
+
+Interactive HTML documentation generator for NSX-T Distributed Firewall configuration. Connects to the NSX Manager Policy API to fetch all security policies, rules, groups, services, and context profiles, then renders a self-contained dark-themed HTML reference with sidebar navigation, enriched object details, and cross-linking between rules and inventory.
+
+Can also work fully offline from a previously exported JSON file.
+
+> **Requires:** `pip install requests` (only for `fetch` mode — offline JSON mode has no dependencies)
+
+## How It Works
+
+The script operates in two stages:
+
+1. **Fetch** — connects to NSX Manager via the Policy API (`/policy/api/v1/infra`) and exports DFW domains, security policies, rules, groups, user-defined services, and context profiles into a single JSON file. System-owned objects (built-in NSX services) are excluded from the export but their display names are preserved when referenced by nested service entries.
+
+2. **Generate** — parses the JSON and produces a fully self-contained HTML document. All CSS, JavaScript, and data are embedded — no external dependencies, works offline in any browser.
+
+## Features
+
+- **Live fetch or offline JSON** — pull directly from NSX Manager or generate from a previously saved JSON export
+- **Category-based layout** — policies grouped by DFW processing order (Ethernet → Emergency → Infrastructure → Environment → Application), sorted by `internal_sequence_number` from the API
+- **Dynamic color palette** — category colors assigned automatically from a 10-color palette, no hardcoded assumptions about category names
+- **Sidebar navigation** — auto-width sidebar listing all policies per category with rule counts; click to jump directly to any policy
+- **Full-text search** — search box filters policies, rules, groups, and services across the entire document
+- **Toggle filters** — one-click buttons to hide auto-generated (system-owned) policies and disabled rules
+- **Enriched groups** — rules display group members inline: IP addresses, tag conditions, VM names (truncated UUIDs for ExternalIDExpression), nested expressions with full condition trees, and clickable cross-references to other groups
+- **Enriched services** — nested service entries (e.g. Microsoft Active Directory V2) are resolved to their constituent service names instead of showing raw `NestedServiceServiceEntry` types
+- **Clickable cross-links** — group names in rules link to the Groups inventory; service names link to the Services inventory
+- **Rule metadata** — displays rule tags / log labels, logging status, enabled/disabled state, direction, IP protocol, and scope
+- **Groups inventory** — full table of all groups with member types, member details, and rule reference counts; unused groups visually dimmed
+- **Services inventory** — all user-defined services with protocol/port details and rule reference counts
+- **`--filter` option** — generate documentation for a specific project or segment by matching against policy names, group names, and rule tags
+- **Fully dynamic** — no hardcoded NSX object names, category names, prefixes, or detection strings; works with any NSX-T environment
+
+## CLI Reference
+
+```
+nsx_dfw_doc.py fetch [output.json] [output.html] [--filter TEXT]
+nsx_dfw_doc.py <input.json> [output.html] [--filter TEXT]
+```
+
+### Modes
+
+| Mode | Description |
+|---|---|
+| `fetch` | Connect to NSX Manager API, export JSON, then generate HTML |
+| `<input.json>` | Generate HTML from a previously exported JSON file |
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `--filter TEXT` | Only include policies matching TEXT (case-insensitive) in policy name, source/destination group names, or rule tags |
+
+### Output Files
+
+| File | When | Default Name |
+|---|---|---|
+| JSON export | `fetch` mode | `dfw_objects.json` |
+| HTML report | Always | `<json_basename>_documentation.html` |
+| Filtered report | `--filter` used | `<json_basename>_<filter>_documentation.html` |
+
+Filenames can be overridden by passing `.json` and/or `.html` paths as positional arguments.
+
+## Usage Examples
+
+### Fetch and Generate
+
+```bash
+# Interactive — prompts for NSX host, username, password
+python3 nsx_dfw_doc.py fetch
+
+# With custom output filenames
+python3 nsx_dfw_doc.py fetch dfw_export.json dfw_report.html
+
+# Fetch and filter in one step
+python3 nsx_dfw_doc.py fetch --filter PROJ-A
+```
+
+### Generate from Existing JSON
+
+```bash
+# Full documentation
+python3 nsx_dfw_doc.py dfw_objects.json
+
+# Custom output path
+python3 nsx_dfw_doc.py dfw_objects.json /tmp/dfw_report.html
+
+# Filtered — only policies related to PROJ-A
+python3 nsx_dfw_doc.py dfw_objects.json --filter PROJ-A
+
+# Filtered — only policies related to PROJ-B
+python3 nsx_dfw_doc.py dfw_objects.json --filter PROJ-B
+```
+
+### Filter Logic
+
+The `--filter` flag performs case-insensitive matching. A policy is included if any of these conditions are met:
+
+| Condition | Behavior |
+|---|---|
+| Policy name contains filter text | All rules of that policy are included |
+| Any rule has source/destination groups whose name contains filter text | Only matching rules are included |
+| Any rule has a tag containing filter text | Only matching rules are included |
+
+This means infrastructure policies that reference project-specific groups are automatically included with the relevant rules, even if the policy name itself does not match.
+
+## Output
+
+### CLI
+
+```
+Loading JSON: dfw_objects.json
+  Found 60 policies, 316 rules
+  2862 groups, 110 services, 2 profiles
+  Categories: Ethernet, Emergency, Infrastructure, Environment, Application
+HTML documentation written to: dfw_objects_documentation.html
+```
+
+With `--filter`:
+
+```
+Loading JSON: dfw_objects.json
+  Found 60 policies, 316 rules
+  2862 groups, 110 services, 2 profiles
+  Categories: Ethernet, Emergency, Infrastructure, Environment, Application
+  Filter 'PROJ-A': 3 policies, 27 rules matched
+HTML documentation written to: dfw_objects_PROJ-A_documentation.html
+```
+
+### HTML Report Structure
+
+The generated HTML document contains these sections:
+
+| Section | Content |
+|---|---|
+| **Sidebar** | Category headers with color indicators, policy names with rule counts, click-to-navigate |
+| **Header** | Title, filter indicator (if active), global stats (policies, rules, categories) |
+| **Filter bar** | Full-text search, toggle buttons for auto-generated policies and disabled rules |
+| **Policies** | One card per policy: metadata row (category badge, enabled/disabled, scope, rule count), then a rules table |
+| **Rules table** | Columns: Seq, Name, Source, Destination, Services, Profiles, Action, Direction, IP Protocol, Flags |
+| **Groups inventory** | All groups with ID, display name, member types, member details, rule reference count |
+| **Services inventory** | All user-defined services with protocol/port details and rule reference count |
+
+### Rule Display Details
+
+Each rule row shows:
+
+| Element | Description |
+|---|---|
+| **Source / Destination** | Group display names with clickable links to inventory; inline member detail (IPs, tags, conditions) |
+| **Services** | Service names with clickable links; protocol/port shown on hover; nested services resolved to constituent names |
+| **Action badge** | Color-coded: green (ALLOW), red (DROP), orange (REJECT) |
+| **Flags** | Logging status with tag label, enabled/disabled state, auto-generated badge for system-owned policies |
+
+### Group Member Display
+
+Groups are rendered with full member detail depending on expression type:
+
+| Expression Type | Display |
+|---|---|
+| IPAddressExpression | Comma-separated IP addresses |
+| Condition | `MemberType Key OPERATOR value` (e.g. `VirtualMachine Tag EQUALS web-tier`) |
+| NestedExpression | Recursive condition tree with AND/OR operators in brackets |
+| PathExpression (groups) | Clickable links to referenced groups |
+| PathExpression (segments) | Segment path names |
+| ExternalIDExpression | Truncated VM UUIDs with count |
+| ConjunctionOperator | `AND` / `OR` between conditions |
+
+### Nested Service Resolution
+
+Services of type `NestedServiceServiceEntry` (e.g. Microsoft Active Directory V2, which bundles 16 sub-services) are resolved to their constituent service display names. If the referenced service exists in the export, its protocol/port details are shown in parentheses. Otherwise, the service display name is shown as-is.
+
+## Configuration
+
+Default connection settings are configured at the top of the script:
+
+```python
+DEFAULT_NSX_HOST = 'nsx.example.local'    # NSX Manager hostname
+DEFAULT_USERNAME = 'audit'                 # Default username (prompted interactively)
+DEFAULT_JSON_OUTPUT = 'dfw_objects.json'   # Default JSON export filename
+```
+
+The `fetch` command prompts interactively for hostname, username, and password. Defaults can be accepted by pressing Enter.
+
+## API Endpoints
+
+The script fetches from three NSX Policy API endpoints:
+
+| Endpoint | Objects |
+|---|---|
+| `/policy/api/v1/infra?filter=Type-Service` | User-defined services (system-owned excluded) |
+| `/policy/api/v1/infra?filter=Type-PolicyContextProfile` | User-defined context profiles |
+| `/policy/api/v1/infra?filter=Type-Domain\|Group\|SecurityPolicy\|Rule` | Domains, groups, security policies, rules |
+
+All three responses are merged into a single JSON file. TLS certificate verification is disabled (`verify=False`) to support self-signed certificates common in lab and production NSX deployments.
+
+## Requirements
+
+- Python 3.8+
+- `requests` for fetch mode (`pip install requests`)
+- No dependencies for offline JSON-to-HTML generation
+
+---
+
 ## DNS Resolution Logic
 
-Both scripts share the same resolution flow for each IP:
+Both `nsxt_fw_analyzer.py` and `dns_cache_update.py` share the same resolution flow for each IP:
 
 ```
 1. Query PRIMARY DNS server
