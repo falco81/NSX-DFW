@@ -6,11 +6,13 @@ Modes:
   nsx_dfw_doc.py fetch [output.json] [output.html]
       Fetch DFW objects from NSX Manager API and generate HTML documentation.
 
-  nsx_dfw_doc.py <dfw_objects.json> [output.html] [--filter TEXT]
+  nsx_dfw_doc.py <input.json> [output.html] [--filter TEXT] [--filter-tag TAG]
       Generate HTML documentation from previously fetched JSON.
 
-  --filter TEXT   Only include policies relevant to TEXT (matched against
-                  policy names, source/destination group names, and rule tags).
+  --filter TEXT        Match policy names, group names, condition values,
+                       effective VM names, rule tags. Case-insensitive.
+  --filter-tag TAG     Match NSX tag scope/value. Colon for AND logic:
+                       --filter-tag Z00:Prod
 """
 
 import os
@@ -22,7 +24,7 @@ from datetime import datetime
 from collections import defaultdict, OrderedDict
 
 # ─── Configuration ───────────────────────────────────────────────────────────
-DEFAULT_NSX_HOST = 'nsx.vmware.local'
+DEFAULT_NSX_HOST = 'nsx.example.local'
 DEFAULT_USERNAME = 'audit'
 DEFAULT_JSON_OUTPUT = 'dfw_objects.json'
 
@@ -146,11 +148,37 @@ def fetch_nsx_objects(nsx_host=None, username=None, password=None, output_file=N
     print(f"    -> {len(dfw_json.get('children', []))} children received")
     dfw_json["children"] = dfw_json["children"] + user_defined_services + user_defined_profiles
 
+    # Fetch VM inventory (paginated)
+    print("  Fetching virtual machines inventory ...")
+    vm_results = []
+    vm_cursor = None
+    while True:
+        vm_url = nsx_mgr + '/api/v1/fabric/virtual-machines?page_size=500'
+        if vm_cursor:
+            vm_url += f'&cursor={vm_cursor}'
+        resp = session.get(vm_url)
+        if resp.status_code != 200:
+            print(f"    WARNING: VM inventory fetch failed (HTTP {resp.status_code}), skipping")
+            break
+        vm_data = resp.json()
+        vm_results.extend(vm_data.get('results', []))
+        vm_cursor = vm_data.get('cursor')
+        if not vm_cursor:
+            break
+    print(f"    -> {len(vm_results)} VMs")
+
+    # Store VM inventory alongside infra data
+    export_data = {
+        "infra": dfw_json,
+        "virtual_machines": vm_results,
+    }
+
     with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(dfw_json, f, indent=4)
+        json.dump(export_data, f, indent=4)
 
     print(f"  Export complete: {len(user_defined_services)} services, "
           f"{len(user_defined_profiles)} profiles, "
+          f"{len(vm_results)} VMs, "
           f"{len(dfw_json['children'])} total children")
     print(f"  Written to: {output_file}")
     return output_file
@@ -162,7 +190,28 @@ def parse_json(filepath):
     """Parse the NSX JSON export into policies, rules, groups, services, profiles."""
     print(f"Loading JSON: {filepath}")
     with open(filepath, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        raw = json.load(f)
+
+    # Support both formats: new wrapper {"infra":..., "virtual_machines":...}
+    # and legacy direct infra export {"children": [...]}
+    if "infra" in raw:
+        data = raw["infra"]
+        vm_list = raw.get("virtual_machines", [])
+    else:
+        data = raw
+        vm_list = []
+
+    # Build VM database: external_id -> {display_name, tags, power_state}
+    vm_db = {}
+    for vm in vm_list:
+        eid = vm.get("external_id", "")
+        if eid:
+            vm_db[eid] = {
+                "display_name": vm.get("display_name", ""),
+                "tags": vm.get("tags", []),
+                "power_state": vm.get("power_state", ""),
+                "host_id": vm.get("host_id", ""),
+            }
 
     policies = []      # flat list of policy dicts (normalized)
     rules_by_policy = defaultdict(list)  # policy_path -> [rule_dicts]
@@ -206,7 +255,10 @@ def parse_json(filepath):
 
     total_rules = sum(len(v) for v in rules_by_policy.values())
     print(f"  Found {len(policies)} policies, {total_rules} rules")
-    print(f"  {len(groups)} groups, {len(services)} services, {len(profiles)} profiles")
+    if vm_db:
+        print(f"  {len(groups)} groups, {len(services)} services, {len(profiles)} profiles, {len(vm_db)} VMs")
+    else:
+        print(f"  {len(groups)} groups, {len(services)} services, {len(profiles)} profiles")
     print(f"  Categories: {', '.join(ordered.keys())}")
 
     # Resolve nested service references
@@ -217,7 +269,7 @@ def parse_json(filepath):
                 if ref_path in services:
                     entry["resolved_entries"] = services[ref_path]["entries"]
 
-    return ordered, rules_by_policy, policy_map, groups, services, profiles
+    return ordered, rules_by_policy, policy_map, groups, services, profiles, vm_db
 
 
 def _parse_domain(domain_obj, policies, rules_by_policy, groups):
@@ -270,6 +322,7 @@ def _parse_domain(domain_obj, policies, rules_by_policy, groups):
                         "scope": r.get("scope", []),
                         "notes": r.get("notes", ""),
                         "tag": r.get("tag", ""),
+                        "log_label": r.get("log_label", ""),
                         "profiles": r.get("profiles", ["ANY"]),
                     })
 
@@ -346,15 +399,30 @@ def _extract_group_members(group_obj):
         elif rt == "PathExpression":
             members.append({"type": "path", "paths": expr.get("paths", [])})
         elif rt == "ExternalIDExpression":
+            eids = expr.get("external_ids", [])
             members.append({
                 "type": "external_id",
                 "member_type": expr.get("member_type", ""),
-                "count": len(expr.get("external_ids", [])),
+                "external_ids": eids,
+                "count": len(eids),
             })
         elif rt == "ConjunctionOperator":
             members.append({"type": "conjunction", "operator": expr.get("conjunction_operator", "OR")})
         elif rt == "NestedExpression":
-            members.append({"type": "nested"})
+            nested_items = []
+            for ne in expr.get("expressions", []):
+                nrt = ne.get("resource_type", "")
+                if nrt == "Condition":
+                    nested_items.append({
+                        "type": "condition",
+                        "member_type": ne.get("member_type", ""),
+                        "key": ne.get("key", ""),
+                        "operator": ne.get("operator", ""),
+                        "value": ne.get("value", ""),
+                    })
+                elif nrt == "ConjunctionOperator":
+                    nested_items.append({"type": "conjunction", "operator": ne.get("conjunction_operator", "OR")})
+            members.append({"type": "nested", "expressions": nested_items})
     return members
 
 
@@ -371,7 +439,9 @@ def get_action_class(action):
     return "action-other"
 
 
-def render_group_members_html(members):
+def render_group_members_html(members, vm_db=None):
+    if vm_db is None:
+        vm_db = {}
     if not members:
         return '<span class="detail-empty">No members defined</span>'
     parts = []
@@ -392,15 +462,38 @@ def render_group_members_html(members):
             if len(m["paths"]) > 4:
                 parts.append(f'<span class="more-count">+{len(m["paths"])-4}</span>')
         elif m["type"] == "external_id":
-            parts.append(f'{_esc(m["member_type"])} &times;{m["count"]}')
+            eids = m.get("external_ids", [])
+            if eids and vm_db:
+                vm_names = []
+                for eid in eids[:5]:
+                    if eid in vm_db:
+                        vm_names.append(f'<a href="#vm-{_esc(eid)}" class="vm-link" title="{_esc(eid)}">{_esc(vm_db[eid]["display_name"])}</a>')
+                    else:
+                        vm_names.append(f'<span class="vm-name" title="{_esc(eid)}">{_esc(eid[:13])}\u2026</span>')
+                shown = ", ".join(vm_names)
+                if len(eids) > 5:
+                    shown += f' <span class="more-count">+{len(eids)-5}</span>'
+                parts.append(shown)
+            else:
+                parts.append(f'{_esc(m["member_type"])} &times;{m["count"]}')
         elif m["type"] == "conjunction":
             parts.append(f'<span class="conj-op">{_esc(m["operator"])}</span>')
         elif m["type"] == "nested":
-            parts.append('<span class="cond-badge">Nested</span>')
+            nested_exprs = m.get("expressions", [])
+            if nested_exprs:
+                inner_parts = []
+                for ne in nested_exprs:
+                    if ne["type"] == "condition":
+                        inner_parts.append(f'<span class="cond-badge">{_esc(ne["member_type"])} {_esc(ne["key"])} {_esc(ne["operator"])} {_esc(ne["value"])}</span>')
+                    elif ne["type"] == "conjunction":
+                        inner_parts.append(f'<span class="conj-op">{_esc(ne["operator"])}</span>')
+                parts.append("[" + " ".join(inner_parts) + "]")
+            else:
+                parts.append('<span class="cond-badge">Nested</span>')
     return " ".join(parts)
 
 
-def format_groups(group_paths, groups_db):
+def format_groups(group_paths, groups_db, vm_db=None):
     """Format list of group paths into HTML."""
     if not group_paths or group_paths == ["ANY"]:
         return '<span class="any-badge">ANY</span>'
@@ -413,7 +506,7 @@ def format_groups(group_paths, groups_db):
         if path in groups_db:
             g = groups_db[path]
             display = g.get("display_name", name)
-            detail = render_group_members_html(g["members"])
+            detail = render_group_members_html(g["members"], vm_db=vm_db)
             parts.append(
                 f'<span class="group-enriched" data-group-path="{_esc(path)}">'
                 f'<a href="#grp-{_esc(g["id"])}" class="group-link">{_esc(display)}</a>'
@@ -483,8 +576,73 @@ def _format_service_entries_compact(entries):
 
 # ─── HTML generation ───
 
+def _build_vm_section(vm_db, groups_db, is_filtered=False, total_vms=0):
+    """Build HTML for VM inventory section."""
+    if not vm_db:
+        return ""
+    tagged_vms = {eid: vm for eid, vm in vm_db.items() if vm.get("tags")}
+    vm_to_groups = defaultdict(list)
+    for g_path, g in groups_db.items():
+        for m in g.get("members", []):
+            if m.get("type") == "external_id":
+                for eid in m.get("external_ids", []):
+                    vm_to_groups[eid].append(g)
+    lines = []
+    lines.append('<div class="category-section" id="vm-inventory">')
+    lines.append('  <div class="category-header" style="--cat-color: #93c5fd">')
+    lines.append('    <span class="cat-dot" style="background: #93c5fd"></span>')
+    lines.append(f'    <h2>Virtual Machines</h2>')
+    if is_filtered:
+        lines.append(f'    <span class="cat-count">{len(vm_db)} VMs (filtered from {total_vms} total)</span>')
+    else:
+        lines.append(f'    <span class="cat-count">{len(vm_db)} VMs ({len(tagged_vms)} tagged)</span>')
+    lines.append('  </div>')
+    lines.append('  <div class="filter-bar">')
+    lines.append('    <input type="text" id="vmSearchInput" placeholder="Filter VMs..." oninput="filterVMs()" />')
+    lines.append('  </div>')
+    lines.append('  <div class="rules-table-wrap">')
+    lines.append('  <table class="rules-table" id="vmTable">')
+    lines.append('    <thead><tr><th>VM Name</th><th>Power</th><th>Tags</th><th>Groups</th></tr></thead>')
+    lines.append('    <tbody>')
+    for eid in sorted(vm_db.keys(), key=lambda e: vm_db[e]["display_name"].lower()):
+        vm = vm_db[eid]
+        tags = vm.get("tags", [])
+        power = vm.get("power_state", "")
+        power_cls = "action-allow" if power == "VM_RUNNING" else "action-drop" if power == "VM_STOPPED" else ""
+        power_short = power.replace("VM_", "").lower() if power else "\u2014"
+        if tags:
+            tag_parts = []
+            for t in tags:
+                scope = t.get("scope", "")
+                tag_val = t.get("tag", "")
+                display = f'{scope}|{tag_val}' if scope else tag_val
+                tag_parts.append(f'<span class="cond-badge" title="{_esc(display)}">{_esc(display)}</span>')
+            tag_html = " ".join(tag_parts)
+        else:
+            tag_html = '<span class="detail-empty">\u2014</span>'
+        grps = vm_to_groups.get(eid, [])
+        if grps:
+            grp_parts = []
+            for g in grps[:5]:
+                grp_parts.append(f'<a href="#grp-{_esc(g["id"])}" class="group-link">{_esc(g["display_name"])}</a>')
+            grp_html = ", ".join(grp_parts)
+            if len(grps) > 5:
+                grp_html += f' <span class="more-count">+{len(grps)-5}</span>'
+        else:
+            grp_html = '<span class="detail-empty">\u2014</span>'
+        unused_cls = "" if tags or grps else "group-unused"
+        lines.append(f'    <tr class="{unused_cls}" id="vm-{_esc(eid)}">')
+        lines.append(f'      <td class="col-name"><a href="#vm-{_esc(eid)}" class="vm-link" title="{_esc(eid)}">{_esc(vm["display_name"])}</a></td>')
+        lines.append(f'      <td><span class="{power_cls}">{_esc(power_short)}</span></td>')
+        lines.append(f'      <td>{tag_html}</td>')
+        lines.append(f'      <td>{grp_html}</td>')
+        lines.append(f'    </tr>')
+    lines.append('    </tbody></table></div></div>')
+    return "\n".join(lines) + "\n"
+
+
 def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
-                  groups_db, services_db, profiles_db, filter_text=None):
+                  groups_db, services_db, profiles_db, vm_db=None, filter_text=None, filter_tag=None):
 
     total_policies = sum(len(v) for v in ordered_categories.values())
     total_rules = sum(len(v) for v in rules_by_policy.values())
@@ -523,6 +681,58 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
         for path in p.get("scope", []):
             if path != "ANY":
                 referenced_groups.add(path)
+
+    # Resolve nested references for complete dependency graph
+    # Groups: follow path members to include nested groups
+    def _resolve_nested_groups(seeds, gdb):
+        resolved = set(seeds)
+        queue = list(seeds)
+        while queue:
+            gpath = queue.pop()
+            g = gdb.get(gpath)
+            if not g:
+                continue
+            for m in g.get("members", []):
+                if m.get("type") == "path":
+                    for p in m.get("paths", []):
+                        if p not in resolved and p in gdb:
+                            resolved.add(p)
+                            queue.append(p)
+        return resolved
+
+    # Services: follow nested_svc entries
+    def _resolve_nested_services(seeds, sdb):
+        resolved = set(seeds)
+        queue = list(seeds)
+        while queue:
+            spath = queue.pop()
+            svc = sdb.get(spath)
+            if not svc:
+                continue
+            for entry in svc.get("entries", []):
+                if entry.get("type") == "nested_svc":
+                    npath = entry.get("nested_service_path", "")
+                    if npath and npath not in resolved and npath in sdb:
+                        resolved.add(npath)
+                        queue.append(npath)
+        return resolved
+
+    referenced_groups = _resolve_nested_groups(referenced_groups, groups_db)
+    referenced_services = _resolve_nested_services(referenced_services, services_db)
+
+    # Collect referenced VMs (from groups that are in the filtered set)
+    referenced_vms = set()
+    if filter_text and vm_db:
+        for gpath in referenced_groups:
+            g = groups_db.get(gpath)
+            if not g:
+                continue
+            for m in g.get("members", []):
+                if m.get("type") == "external_id":
+                    referenced_vms.update(m.get("external_ids", []))
+            # Also evaluate conditions to find dynamically matching VMs
+            effective = _get_group_effective_vm_eids(g, vm_db)
+            referenced_vms.update(effective)
 
     # ─── Build sidebar + content ───
     nav_html = ""
@@ -598,7 +808,7 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
                 content_html += '  <div class="rules-table-wrap">\n'
                 content_html += '  <table class="rules-table">\n'
                 content_html += '    <thead><tr>\n'
-                content_html += '      <th>Seq</th><th>Name</th><th>Action</th><th>Source</th><th>Destination</th><th>Services</th><th>Dir</th><th>Flags</th>\n'
+                content_html += '      <th>Seq</th><th>Name</th><th>Action</th><th>Source</th><th>Destination</th><th>Services</th><th>Dir</th><th>Flags</th><th>Log Prefix</th>\n'
                 content_html += '    </tr></thead>\n'
                 content_html += '    <tbody>\n'
 
@@ -625,11 +835,16 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
                     content_html += f'      <td class="col-seq">{_esc(str(seq))}</td>\n'
                     content_html += f'      <td class="col-name" title="{_esc(r_name)}">{_esc(r_name)}</td>\n'
                     content_html += f'      <td class="col-action"><span class="action-badge {action_cls}">{_esc(action)}</span></td>\n'
-                    content_html += f'      <td class="col-src">{format_groups(r.get("source_groups", ["ANY"]), groups_db)}</td>\n'
-                    content_html += f'      <td class="col-dst">{format_groups(r.get("destination_groups", ["ANY"]), groups_db)}</td>\n'
+                    content_html += f'      <td class="col-src">{format_groups(r.get("source_groups", ["ANY"]), groups_db, vm_db)}</td>\n'
+                    content_html += f'      <td class="col-dst">{format_groups(r.get("destination_groups", ["ANY"]), groups_db, vm_db)}</td>\n'
                     content_html += f'      <td class="col-svc">{format_services(r.get("services", ["ANY"]), services_db)}</td>\n'
                     content_html += f'      <td class="col-dir">{_esc(r.get("direction", ""))}</td>\n'
                     content_html += f'      <td class="col-flags">{"".join(flags)}</td>\n'
+                    log_prefix = r.get("tag", "") or r.get("log_label", "")
+                    if log_prefix:
+                        content_html += f'      <td class="col-logprefix"><span class="log-prefix">{_esc(log_prefix)}</span></td>\n'
+                    else:
+                        content_html += f'      <td class="col-logprefix"><span class="detail-empty">\u2014</span></td>\n'
                     content_html += f'    </tr>\n'
 
                 content_html += '    </tbody></table></div>\n'
@@ -648,17 +863,51 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
     default_groups = {p: g for p, g in groups_db.items() if g.get("domain") == "default"}
     ref_groups = {p: g for p, g in default_groups.items() if p in referenced_groups}
 
+    # When filter is active, only show referenced groups (with nested deps)
+    if filter_text:
+        display_groups = ref_groups
+    else:
+        display_groups = default_groups
+
+    # Pre-calculate display_services for nav counts
+    ref_svc_count = len(referenced_services & set(services_db.keys()))
+    if filter_text:
+        display_services = {p: s for p, s in services_db.items() if p in referenced_services}
+    else:
+        display_services = services_db
+
+    # Pre-calculate display_vm_db for nav counts
+    if filter_text and vm_db and referenced_vms:
+        display_vm_db = {eid: vm for eid, vm in vm_db.items() if eid in referenced_vms}
+    else:
+        display_vm_db = vm_db if vm_db else {}
+
+    # When filter_tag is active, further restrict VMs to only those matching the tag
+    if filter_tag and vm_db:
+        tag_parts = [p.lower() for p in filter_tag.split(":")]
+        display_vm_db = {eid: vm for eid, vm in display_vm_db.items()
+                         if _vm_tag_matches(vm, tag_parts)}
+
     groups_nav += '<div class="nav-category" style="--cat-color: #a78bfa">\n'
     groups_nav += '  <div class="nav-cat-label">Inventory</div>\n'
-    groups_nav += f'  <a class="nav-policy" href="#groups-inventory">Groups ({len(default_groups)})</a>\n'
-    groups_nav += f'  <a class="nav-policy" href="#services-inventory">Services ({len(services_db)})</a>\n'
+    groups_nav += f'  <a class="nav-policy" href="#groups-inventory">Groups ({len(display_groups)})</a>\n'
+    groups_nav += f'  <a class="nav-policy" href="#services-inventory">Services ({len(display_services)})</a>\n'
+    if vm_db:
+        if filter_text or filter_tag:
+            groups_nav += f'  <a class="nav-policy" href="#vm-inventory">VMs ({len(display_vm_db)} filtered)</a>\n'
+        else:
+            tagged_vm_count = sum(1 for vm in vm_db.values() if vm.get("tags"))
+            groups_nav += f'  <a class="nav-policy" href="#vm-inventory">VMs ({len(vm_db)}, {tagged_vm_count} tagged)</a>\n'
     groups_nav += '</div>\n'
 
     groups_section += '<div class="category-section" id="groups-inventory">\n'
     groups_section += '  <div class="category-header" style="--cat-color: #a78bfa">\n'
     groups_section += '    <span class="cat-dot" style="background: #a78bfa"></span>\n'
     groups_section += f'    <h2>Groups</h2>\n'
-    groups_section += f'    <span class="cat-count">{len(default_groups)} groups ({len(ref_groups)} used in rules)</span>\n'
+    if filter_text:
+        groups_section += f'    <span class="cat-count">{len(display_groups)} groups (filtered from {len(default_groups)} total)</span>\n'
+    else:
+        groups_section += f'    <span class="cat-count">{len(default_groups)} groups ({len(ref_groups)} used in rules)</span>\n'
     groups_section += '  </div>\n'
     groups_section += '  <div class="filter-bar">\n'
     groups_section += '    <input type="text" id="groupSearchInput" placeholder="Filter groups..." oninput="filterGroups()" />\n'
@@ -669,12 +918,12 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
     groups_section += '    <thead><tr><th>Name</th><th>Type</th><th>Members</th><th>Rules</th></tr></thead>\n'
     groups_section += '    <tbody>\n'
 
-    for g_path in sorted(default_groups.keys(), key=lambda p: default_groups[p]["display_name"].lower()):
-        g = default_groups[g_path]
+    for g_path in sorted(display_groups.keys(), key=lambda p: display_groups[p]["display_name"].lower()):
+        g = display_groups[g_path]
         is_used = g_path in referenced_groups
         used_cls = "" if is_used else "group-unused"
         members = g["members"]
-        detail_html = render_group_members_html(members)
+        detail_html = render_group_members_html(members, vm_db=vm_db)
 
         mtypes = set()
         for m in members:
@@ -701,12 +950,14 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
 
     # ─── Services Inventory ───
     services_section = ""
-    ref_svc_count = len(referenced_services & set(services_db.keys()))
     services_section += '<div class="category-section" id="services-inventory">\n'
     services_section += '  <div class="category-header" style="--cat-color: #a78bfa">\n'
     services_section += '    <span class="cat-dot" style="background: #a78bfa"></span>\n'
     services_section += f'    <h2>Services</h2>\n'
-    services_section += f'    <span class="cat-count">{len(services_db)} services ({ref_svc_count} used in rules)</span>\n'
+    if filter_text:
+        services_section += f'    <span class="cat-count">{len(display_services)} services (filtered from {len(services_db)} total)</span>\n'
+    else:
+        services_section += f'    <span class="cat-count">{len(services_db)} services ({ref_svc_count} used in rules)</span>\n'
     services_section += '  </div>\n'
     services_section += '  <div class="filter-bar">\n'
     services_section += '    <input type="text" id="svcSearchInput" placeholder="Filter services..." oninput="filterServices()" />\n'
@@ -716,8 +967,8 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
     services_section += '    <thead><tr><th>Name</th><th>Protocol / Ports</th><th>Rules</th></tr></thead>\n'
     services_section += '    <tbody>\n'
 
-    for s_path in sorted(services_db.keys(), key=lambda p: services_db[p]["display_name"].lower()):
-        svc = services_db[s_path]
+    for s_path in sorted(display_services.keys(), key=lambda p: display_services[p]["display_name"].lower()):
+        svc = display_services[s_path]
         port_str = _format_service_entries_compact(svc["entries"])
         is_used = s_path in referenced_services
         used_cls = "" if is_used else "group-unused"
@@ -732,6 +983,8 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
         services_section += f'    </tr>\n'
 
     services_section += '    </tbody></table></div></div>\n'
+
+    vm_section = _build_vm_section(display_vm_db, groups_db, is_filtered=bool(filter_text or filter_tag), total_vms=len(vm_db) if vm_db else 0)
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -820,6 +1073,8 @@ body {{ font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; background
 .col-svc {{ min-width: 100px; max-width: 280px; word-break: break-word; }}
 .col-dir {{ width: 60px; font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; font-size: 10px; color: var(--text-dim); }}
 .col-flags {{ width: 100px; }}
+.col-logprefix {{ min-width: 80px; max-width: 200px; word-break: break-word; }}
+.log-prefix {{ font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; font-size: 10px; color: var(--text-dim); background: rgba(139,144,160,0.08); padding: 1px 5px; border-radius: 3px; }}
 
 .action-badge {{ display: inline-block; font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; font-size: 10px; font-weight: 700; padding: 3px 8px; border-radius: 4px; text-transform: uppercase; }}
 .action-allow {{ background: rgba(52,211,153,0.15); color: #34d399; }}
@@ -847,6 +1102,9 @@ body {{ font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; background
 .group-detail .path-ref {{ color: var(--green); font-size: 10px; }}
 .group-detail .conj-op {{ color: var(--text-dim); font-size: 9px; font-weight: 600; }}
 .detail-empty {{ color: var(--text-dim); font-size: 10px; font-style: italic; }}
+.vm-name {{ font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; font-size: 11px; color: #93c5fd; }}
+.vm-link {{ font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; font-size: 11px; color: #93c5fd; text-decoration: none; border-bottom: 1px dotted rgba(147,197,253,0.4); cursor: pointer; }}
+.vm-link:hover {{ color: var(--text-bright); border-bottom-color: var(--text-bright); }}
 
 .svc-enriched {{ display: inline-block; margin: 2px 0; }}
 .svc-ports {{ display: block; font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; font-size: 10px; color: var(--green); line-height: 1.4; }}
@@ -889,8 +1147,9 @@ tr.group-unused:hover {{ opacity: 0.8; }}
     <div class="stat-card"><div class="stat-value amber">{total_reject}</div><div class="stat-label">Reject</div></div>
     <div class="stat-card"><div class="stat-value purple">{disabled_rules}</div><div class="stat-label">Disabled</div></div>
     <div class="stat-card"><div class="stat-value">{user_policies}</div><div class="stat-label">User policies</div></div>
-    <div class="stat-card"><div class="stat-value purple">{len(groups_db)}</div><div class="stat-label">Groups</div></div>
-    <div class="stat-card"><div class="stat-value purple">{len(services_db)}</div><div class="stat-label">Services</div></div>
+    <div class="stat-card"><div class="stat-value purple">{len(display_groups)}</div><div class="stat-label">Groups</div></div>
+    <div class="stat-card"><div class="stat-value purple">{len(display_services)}</div><div class="stat-label">Services</div></div>
+    <div class="stat-card"><div class="stat-value blue">{len(display_vm_db)}</div><div class="stat-label">VMs</div></div>
   </div>
 
   <div class="filter-bar">
@@ -902,6 +1161,7 @@ tr.group-unused:hover {{ opacity: 0.8; }}
   {content_html}
   {groups_section}
   {services_section}
+  {vm_section}
 </main>
 
 <script>
@@ -943,6 +1203,12 @@ function filterGroups() {{
   }});
 }}
 function toggleUnused(btn) {{ hideUnused=!hideUnused; btn.classList.toggle('active',hideUnused); filterGroups(); }}
+function filterVMs(){{
+  var q=document.getElementById('vmSearchInput').value.toLowerCase();
+  document.querySelectorAll('#vmTable tbody tr').forEach(function(tr){{
+    tr.style.display=tr.textContent.toLowerCase().includes(q)?'':'none';
+  }});
+}}
 function filterServices() {{
   const q=(document.getElementById('svcSearchInput')||{{}}).value||'';
   const ql=q.toLowerCase();
@@ -963,29 +1229,206 @@ function filterServices() {{
 
 # ─── Main ───
 
-def filter_policies(ordered_categories, rules_by_policy, policy_map, groups_db, filter_text):
-    ft = filter_text.lower()
+
+# ─── Condition evaluation helpers ───
+
+def _vm_matches_condition(vm, member_type, key, operator, value):
+    """Evaluate a single NSX Condition against a VM from vm_db."""
+    mt = member_type.lower()
+    if mt != "virtualmachine":
+        return False
+    k = key.lower()
+    op = operator.upper()
+    val = value.lower()
+    if k == "name":
+        target = vm.get("display_name", "").lower()
+    elif k == "tag":
+        for t in vm.get("tags", []):
+            ts = ((t.get("scope", "") or "") + "|" + (t.get("tag", "") or "")).lower()
+            tv = (t.get("tag", "") or "").lower()
+            if op == "EQUALS" and (ts == val or tv == val):
+                return True
+            elif op == "NOTEQUALS" and ts != val and tv != val:
+                return True
+            elif op == "CONTAINS" and val in ts:
+                return True
+            elif op == "STARTSWITH" and (ts.startswith(val) or tv.startswith(val)):
+                return True
+            elif op == "ENDSWITH" and (ts.endswith(val) or tv.endswith(val)):
+                return True
+        return False
+    elif k == "computername":
+        target = vm.get("display_name", "").lower()
+    else:
+        return False
+    if op == "EQUALS":
+        return target == val
+    elif op == "NOTEQUALS":
+        return target != val
+    elif op == "CONTAINS":
+        return val in target
+    elif op == "STARTSWITH":
+        return target.startswith(val)
+    elif op == "ENDSWITH":
+        return target.endswith(val)
+    return False
+
+
+def _get_group_effective_vm_eids(group, vm_db):
+    """Evaluate group conditions against vm_db, return set of matching eids."""
+    if not vm_db:
+        return set()
+    members = group.get("members", [])
+    # Collect condition blocks with conjunction operators between them
+    condition_blocks = []  # list of (kind, inner_op, conds)
+    conjunctions = []      # conjunction ops BETWEEN blocks
+    current_block = []
+    for m in members:
+        if m.get("type") == "condition":
+            current_block.append(m)
+        elif m.get("type") == "nested":
+            nc = [ne for ne in m.get("expressions", []) if ne.get("type") == "condition"]
+            nj = [ne for ne in m.get("expressions", []) if ne.get("type") == "conjunction"]
+            if nc:
+                if current_block:
+                    condition_blocks.append(("simple", None, current_block))
+                    current_block = []
+                nop = nj[0].get("operator", "AND").upper() if nj else "AND"
+                condition_blocks.append(("nested", nop, nc))
+        elif m.get("type") == "conjunction":
+            if current_block:
+                condition_blocks.append(("simple", None, current_block))
+                current_block = []
+            conjunctions.append(m.get("operator", "OR").upper())
+        elif m.get("type") == "external_id":
+            return set(m.get("external_ids", []))
+    if current_block:
+        condition_blocks.append(("simple", None, current_block))
+    if not condition_blocks:
+        return set()
+    result = None
+    for i, (kind, op, conds) in enumerate(condition_blocks):
+        block_eids = set()
+        for eid, vm in vm_db.items():
+            check = any if (kind == "nested" and op == "OR") else all
+            if check(_vm_matches_condition(vm, c.get("member_type", ""), c.get("key", ""),
+                     c.get("operator", ""), c.get("value", "")) for c in conds):
+                block_eids.add(eid)
+        if result is None:
+            result = block_eids
+        else:
+            conj = conjunctions[i - 1] if i - 1 < len(conjunctions) else "AND"
+            if conj == "OR":
+                result = result | block_eids
+            else:
+                result = result & block_eids
+    return result or set()
+
+
+def _vm_tag_matches(vm, filter_parts):
+    """Check if VM tags match all filter_tag parts (AND logic)."""
+    tags = vm.get("tags", [])
+    if not tags:
+        return False
+    tag_strings = []
+    for t in tags:
+        s = (t.get("scope", "") or "").lower()
+        v = (t.get("tag", "") or "").lower()
+        tag_strings.extend([s + "|" + v, s, v])
+    for part in filter_parts:
+        if not any(part in ts for ts in tag_strings):
+            return False
+    return True
+
+
+def filter_policies(ordered_categories, rules_by_policy, policy_map, groups_db,
+                    filter_text=None, filter_tag=None, vm_db=None):
+    if vm_db is None:
+        vm_db = {}
+    ft = filter_text.lower() if filter_text else None
+    tag_parts = [p.lower() for p in filter_tag.split(":")] if filter_tag else []
+    _effective_cache = {}
+    def _get_effective(path):
+        if path not in _effective_cache:
+            g = groups_db.get(path)
+            _effective_cache[path] = _get_group_effective_vm_eids(g, vm_db) if g else set()
+        return _effective_cache[path]
     filtered_ordered = OrderedDict()
     filtered_rules = {}
     filtered_pmap = {}
-
-    def group_path_matches(path):
+    def group_matches_text(path, text):
         if not path or path == "ANY":
             return False
         name = path.split("/")[-1].lower()
-        if ft in name:
+        if text in name:
             return True
-        if path in groups_db:
-            if ft in groups_db[path].get("display_name", "").lower():
+        if path not in groups_db:
+            return False
+        g = groups_db[path]
+        if text in g.get("display_name", "").lower():
+            return True
+        for m in g.get("members", []):
+            if m.get("type") == "condition":
+                if text in m.get("value", "").lower():
+                    return True
+            elif m.get("type") == "nested":
+                for ne in m.get("expressions", []):
+                    if ne.get("type") == "condition":
+                        if text in ne.get("value", "").lower():
+                            return True
+            elif m.get("type") == "external_id":
+                for eid in m.get("external_ids", []):
+                    if eid in vm_db:
+                        if text in vm_db[eid].get("display_name", "").lower():
+                            return True
+                        for t in vm_db[eid].get("tags", []):
+                            tag_str = ((t.get("scope","") or "") + "|" + (t.get("tag","") or "")).lower()
+                            if text in tag_str:
+                                return True
+        effective = _get_effective(path)
+        for eid in effective:
+            if eid in vm_db and text in vm_db[eid].get("display_name", "").lower():
                 return True
         return False
-
+    def group_matches_tag(path, parts):
+        if not path or path == "ANY" or path not in groups_db:
+            return False
+        g = groups_db[path]
+        for m in g.get("members", []):
+            if m.get("type") == "condition" and m.get("key", "").lower() == "tag":
+                val = m.get("value", "").lower()
+                if all(p in val for p in parts):
+                    return True
+            elif m.get("type") == "nested":
+                for ne in m.get("expressions", []):
+                    if ne.get("type") == "condition" and ne.get("key", "").lower() == "tag":
+                        val = ne.get("value", "").lower()
+                        if all(p in val for p in parts):
+                            return True
+            elif m.get("type") == "external_id":
+                for eid in m.get("external_ids", []):
+                    if eid in vm_db and _vm_tag_matches(vm_db[eid], parts):
+                        return True
+        effective = _get_effective(path)
+        for eid in effective:
+            if eid in vm_db and _vm_tag_matches(vm_db[eid], parts):
+                return True
+        return False
+    def group_path_matches(path):
+        if not path or path == "ANY":
+            return False
+        text_ok = group_matches_text(path, ft) if ft else True
+        tag_ok = group_matches_tag(path, tag_parts) if tag_parts else True
+        if ft and tag_parts:
+            return text_ok or tag_ok
+        return text_ok and tag_ok
     for cat, policies in ordered_categories.items():
         matching = []
         for p in policies:
             path = p["path"]
             policy_rules = rules_by_policy.get(path, [])
-            if ft in p.get("display_name", "").lower():
+            policy_name_hit = ft and ft in p.get("display_name", "").lower()
+            if policy_name_hit and not tag_parts:
                 matching.append(p)
                 filtered_rules[path] = policy_rules
                 filtered_pmap[path] = p
@@ -993,12 +1436,20 @@ def filter_policies(ordered_categories, rules_by_policy, policy_map, groups_db, 
             matched_rules = []
             for r in policy_rules:
                 hit = False
-                if ft in r.get("tag", "").lower():
+                if ft and ft in r.get("tag", "").lower():
                     hit = True
                 if not hit:
                     for field in ("source_groups", "destination_groups", "scope"):
                         for gpath in r.get(field, []):
                             if group_path_matches(gpath):
+                                hit = True
+                                break
+                        if hit:
+                            break
+                if not hit and policy_name_hit and tag_parts:
+                    for field in ("source_groups", "destination_groups", "scope"):
+                        for gpath in r.get(field, []):
+                            if group_matches_tag(gpath, tag_parts):
                                 hit = True
                                 break
                         if hit:
@@ -1011,10 +1462,14 @@ def filter_policies(ordered_categories, rules_by_policy, policy_map, groups_db, 
                 filtered_pmap[path] = p
         if matching:
             filtered_ordered[cat] = matching
-
     tp = sum(len(v) for v in filtered_ordered.values())
     tr = sum(len(v) for v in filtered_rules.values())
-    print(f"  Filter \'{filter_text}\': {tp} policies, {tr} rules matched")
+    parts_desc = []
+    if filter_text:
+        parts_desc.append(f"text=\'{filter_text}\'")
+    if filter_tag:
+        parts_desc.append(f"tag=\'{filter_tag}\'")
+    print(f"  Filter {', '.join(parts_desc)}: {tp} policies, {tr} rules matched")
     return filtered_ordered, filtered_rules, filtered_pmap
 
 
@@ -1022,21 +1477,25 @@ def print_usage():
     print("""NSX DFW Documentation Generator
 
 Usage:
-  nsx_dfw_doc.py fetch [dfw_objects.json] [output.html] [--filter TEXT]
-      Fetch DFW objects from NSX Manager API and generate HTML.
-      Default output: dfw_objects.json + dfw_objects_documentation.html
+  nsx_dfw_doc.py fetch [output.json] [output.html] [--filter TEXT] [--filter-tag TAG]
+      Fetch DFW objects + VM inventory and generate HTML.
 
-  nsx_dfw_doc.py <dfw_objects.json> [output.html] [--filter TEXT]
-      Generate HTML documentation from previously fetched JSON.
+  nsx_dfw_doc.py <input.json> [output.html] [--filter TEXT] [--filter-tag TAG]
+      Generate HTML from previously fetched JSON.
 
-  --filter TEXT   Only include policies relevant to TEXT (matched against
-                  policy names, source/destination group names, and rule tags).
+  --filter TEXT        Match policy names, group names, condition values,
+                       effective VM names (STARTSWITH/ENDSWITH/etc.), rule tags.
+  --filter-tag TAG     Match NSX tag scope/value (colon = AND logic):
+                         --filter-tag Z00:Prod
+  Both filters can be combined. Case-insensitive.
 
 Examples:
   nsx_dfw_doc.py fetch
-  nsx_dfw_doc.py fetch dfw_objects.json report.html
   nsx_dfw_doc.py dfw_objects.json
   nsx_dfw_doc.py dfw_objects.json --filter Z00
+  nsx_dfw_doc.py dfw_objects.json --filter-tag Z00
+  nsx_dfw_doc.py dfw_objects.json --filter-tag Z00:Prod
+  nsx_dfw_doc.py dfw_objects.json --filter xdc --filter-tag Z00
   nsx_dfw_doc.py fetch --filter WSA04""")
 
 
@@ -1047,13 +1506,17 @@ def main():
 
     args = sys.argv[1:]
 
-    # Extract --filter argument
+    # Extract --filter and --filter-tag arguments
     filter_text = None
+    filter_tag = None
     clean_args = []
     i = 0
     while i < len(args):
         if args[i] == "--filter" and i + 1 < len(args):
             filter_text = args[i + 1]
+            i += 2
+        elif args[i] == "--filter-tag" and i + 1 < len(args):
+            filter_tag = args[i + 1]
             i += 2
         else:
             clean_args.append(args[i])
@@ -1086,18 +1549,32 @@ def main():
 
     if html_output is None:
         base = os.path.splitext(os.path.basename(json_file))[0]
+        suffix_parts = []
         if filter_text:
-            html_output = base + "_" + filter_text + "_documentation.html"
+            suffix_parts.append(filter_text)
+        if filter_tag:
+            suffix_parts.append("tag-" + filter_tag.replace(":", "-"))
+        if suffix_parts:
+            html_output = base + "_" + "_".join(suffix_parts) + "_documentation.html"
         else:
             html_output = base + "_documentation.html"
 
-    ordered, rules_by_policy, policy_map, groups_db, services_db, profiles_db = parse_json(json_file)
+    ordered, rules_by_policy, policy_map, groups_db, services_db, profiles_db, vm_db = parse_json(json_file)
 
-    if filter_text:
+    if filter_text or filter_tag:
         ordered, rules_by_policy, policy_map = filter_policies(
-            ordered, rules_by_policy, policy_map, groups_db, filter_text)
+            ordered, rules_by_policy, policy_map, groups_db,
+            filter_text=filter_text, filter_tag=filter_tag, vm_db=vm_db)
 
-    generate_html(ordered, rules_by_policy, policy_map, html_output, groups_db, services_db, profiles_db, filter_text=filter_text)
+    filter_label = None
+    if filter_text and filter_tag:
+        filter_label = f"{filter_text} + tag:{filter_tag}"
+    elif filter_text:
+        filter_label = filter_text
+    elif filter_tag:
+        filter_label = f"tag:{filter_tag}"
+
+    generate_html(ordered, rules_by_policy, policy_map, html_output, groups_db, services_db, profiles_db, vm_db=vm_db, filter_text=filter_label, filter_tag=filter_tag)
 
 
 if __name__ == "__main__":
