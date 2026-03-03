@@ -1,6 +1,6 @@
 # NSX-T DFW Log Analyzer
 
-A Python toolkit for analyzing VMware NSX-T Distributed Firewall (DFW) logs. Extracts, deduplicates, and filters flow records from Log Insight / Aria Operations for Logs exports, producing CSV reports or fully interactive HTML dashboards — all completely offline.
+A Python toolkit for analyzing VMware NSX-T Distributed Firewall (DFW) logs. Connects to tar.gz exports from Log Insight / Aria Operations for Logs, extracts and deduplicates flow records, enriches them with DNS and service names, and produces CSV reports or fully interactive HTML dashboards — all completely offline.
 
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
@@ -8,7 +8,7 @@ A Python toolkit for analyzing VMware NSX-T Distributed Firewall (DFW) logs. Ext
 
 ## The Problem
 
-NSX-T DFW log exports from Log Insight can contain tens of millions of raw syslog rows across dozens of CSV files packed in a tar.gz archive. Manually sifting through these to identify unique flows, blocked traffic, or suspicious connections is impractical. You need a way to deduplicate, filter, enrich (DNS, service names), and visualize the data — ideally without uploading anything to external services.
+NSX-T DFW log exports from Log Insight can contain **tens of millions** of raw syslog rows spread across dozens of CSV files packed in a tar.gz archive. Manually sifting through these to identify unique flows, blocked traffic, or suspicious connections is impractical. You need a way to deduplicate, filter, enrich (DNS PTR, service names), and visualize the data — ideally without uploading anything to external services.
 
 This toolkit solves that with two scripts:
 
@@ -20,15 +20,17 @@ This toolkit solves that with two scripts:
 ## Features
 
 - **Extract & deduplicate** — reads tar.gz archives with CSVs, deduplicates flows by `(src_ip, dst_ip, dst_port, protocol)`
-- **IP class filtering** — filter by private (RFC 1918), public, multicast, or show all
+- **IP class filtering** — filter by private (RFC 1918 + CGNAT 100.64/10), public, multicast, or show all
+- **Load Balancer detection** — identifies NSX LB traffic via 100.64.0.0/10 SNAT addresses, with dedicated badge, stats card, and one-click toggle filter
+- **GeoIP country flags** — offline SVG flag icons next to public IPs using the free DB-IP Lite database; interactive stats card lets you click any flag to filter by country
 - **Flexible exclusions** — exclude specific IPs/ports via CLI flags or file lists
 - **DNS PTR resolution** — reverse DNS against up to 2 custom DNS servers with persistent file cache and automatic retry of failed lookups
 - **Port-to-service translation** — maps port numbers to service names (built-in ~270 ports or optional full IANA database with ~6,000 entries)
 - **Protocol descriptions** — human-readable labels for non-TCP/UDP protocols (ICMP, GRE, OSPF, etc.)
 - **Interactive HTML report** — self-contained, offline-capable dark-themed dashboard with sorting, filtering, drag-and-drop column management, and clickable Top Talkers
+- **Auto-download** — built-in `--download-geoip`, `--download-services`, and `--download-all` flags to fetch optional databases without manual wget commands
 - **Bulk DNS helper** — standalone script for pre-populating, refreshing, and exporting the DNS cache
 - **Performance** — handles tens of millions of rows with IP classification cache and set-based deduplication
-- **Zero dependencies** — core functionality works with Python standard library only; `dnspython` optional for custom DNS servers
 
 ## Installation
 
@@ -41,7 +43,7 @@ cd nsxt-fw-analyzer
 pip install dnspython
 ```
 
-> On RHEL/Fedora without internet pip access: `dnf install python3-dns`
+> On RHEL/Fedora without pip access: `dnf install python3-dns`
 
 ### File Layout
 
@@ -50,21 +52,25 @@ nsxt-fw-analyzer/
 ├── nsxt_fw_analyzer.py      # Main analyzer script
 ├── dns_cache_update.py      # DNS cache management helper
 ├── .dns_ptr_cache.json      # Auto-generated DNS cache (gitignored)
-├── services-db.csv          # Optional IANA port database
+├── services-db.csv          # Optional IANA port database (--download-services)
+├── geoip-country.csv        # Optional GeoIP country database (--download-geoip)
 └── README.md
 ```
 
 ## Quick Start
 
 ```bash
+# Download optional databases (IANA services + GeoIP country)
+python3 nsxt_fw_analyzer.py --download-all
+
 # Basic analysis — private IPs only (default)
 python3 nsxt_fw_analyzer.py export.tar.gz
 
 # All IPs with interactive HTML report
 python3 nsxt_fw_analyzer.py export.tar.gz -m all --html
 
-# Full analysis with DNS resolution
-python3 nsxt_fw_analyzer.py export.tar.gz -m all --resolve-dns --html -o report.html
+# Public IPs with DNS + GeoIP country flags
+python3 nsxt_fw_analyzer.py export.tar.gz -m public --resolve-dns --html -o report.html
 ```
 
 ---
@@ -79,10 +85,12 @@ The script expects a `.tar.gz` archive containing CSV files exported from VMware
 
 | Mode | Description |
 |---|---|
-| `private` | Both src and dst must be RFC 1918 (10.x, 172.16-31.x, 192.168.x) — **default** |
+| `private` | Both src and dst must be RFC 1918 (10.x, 172.16-31.x, 192.168.x) or CGNAT (100.64.0.0/10) — **default** |
 | `public` | At least one IP is publicly routable |
 | `multicast` | At least one IP is in 224.0.0.0/4 |
 | `all` | No IP class filtering |
+
+The 100.64.0.0/10 range (Shared Address Space / CGNAT) is classified as private because NSX-T Load Balancers use these addresses for SNAT. Flows involving these IPs are automatically tagged with an `LB` badge in the HTML report.
 
 ## CLI Reference
 
@@ -127,6 +135,16 @@ python3 nsxt_fw_analyzer.py INPUT [OPTIONS]
 | `--dns-server2 IP` | Secondary DNS server (fallback if primary fails) |
 | `--dns-cache-file PATH` | Custom cache file path |
 
+### Database Download
+
+| Flag | Description |
+|---|---|
+| `--download-services` | Download IANA port-to-service database (~580 KB) |
+| `--download-geoip` | Download DB-IP Country Lite GeoIP database (~24 MB, auto-detects current month) |
+| `--download-all` | Download both databases at once |
+
+These flags require no positional argument — they download the file next to the script and exit. If the current month's GeoIP release is not available yet, the previous month is used automatically.
+
 ## Usage Examples
 
 ### Basic Analysis
@@ -158,7 +176,8 @@ python3 nsxt_fw_analyzer.py logs_export.tar.gz \
 ```
 
 Example `skip_ips.txt`:
-```
+
+```text
 # Management IPs
 10.0.0.1
 10.0.0.2
@@ -199,11 +218,20 @@ python3 nsxt_fw_analyzer.py logs_export.tar.gz \
     -o full_analysis.csv
 ```
 
+### Download Optional Databases
+
+```bash
+# Download IANA services database (~580 KB, ~6,000 port mappings)
+python3 nsxt_fw_analyzer.py --download-services
+
+# Download GeoIP country database (~24 MB, auto-detects current month)
+python3 nsxt_fw_analyzer.py --download-geoip
+
+# Download both at once
+python3 nsxt_fw_analyzer.py --download-all
+```
+
 ## Output
-
-### CSV
-
-Standard comma-separated output with all columns. Importable into Excel, Google Sheets, or any SIEM.
 
 ### CLI
 
@@ -222,8 +250,8 @@ Standard comma-separated output with all columns. Importable into Excel, Google 
   Found 15 CSV files
 
 [2/4] Processing & deduplicating...
-  [export1.csv] 2,586 rows
-  [export2.csv] 4,831 rows
+  [export_001.csv] 2,586 rows
+  [export_002.csv] 4,831 rows
   ...
 ─────────────────────────────────────────────
   Total rows:          26,726
@@ -242,6 +270,14 @@ Standard comma-separated output with all columns. Importable into Excel, Google 
 
 Done in 8.3s
 ```
+
+### CSV
+
+Standard comma-separated output with all columns. Importable into Excel, Google Sheets, or any SIEM.
+
+### HTML
+
+Fully self-contained interactive report — see [Interactive HTML Report](#interactive-html-report) below.
 
 ## Output Columns
 
@@ -270,8 +306,9 @@ The `--html` flag generates a fully self-contained HTML file that works offline 
 
 ### Dashboard
 
-- **Statistics cards** — total unique flows, PASS/DROP/REJECT counts with percentages, protocol breakdown, unique port count
-- **Top Talkers** — expandable panel showing top 10 source IPs, top 10 destination IPs, and top 15 destination ports with bar charts
+- **Statistics cards** — total unique flows, PASS/DROP/REJECT counts with percentages, protocol breakdown, Load Balancer flow count (100.64/10)
+- **GeoIP card** — when GeoIP database is present, shows country count with clickable SVG flag icons; click any flag to filter the table by that country
+- **Top Talkers** — expandable panels showing top 10 source IPs, top 10 destination IPs, and top 15 destination ports with bar charts
 
 ### Table Features
 
@@ -279,37 +316,42 @@ The `--html` flag generates a fully self-contained HTML file that works offline 
 |---|---|
 | **Global search** | Fulltext search across all columns with match highlighting |
 | **Column sorting** | Click column header popup → Sort Ascending / Sort Descending |
-| **Per-column filters** | Click any column header for a filter popup (see Filter Syntax below) |
-| **Negation filters** | Prefix `!` to exclude matches: `!DROP`, `!10.0.*` |
-| **Multi-column filters** | Multiple column filters combine as AND |
-| **Drag & drop columns** | Reorder columns by dragging headers |
-| **Show/hide columns** | "Columns" button toggles visibility (Host, Cluster, DC hidden by default) |
-| **Interactive Top Talkers** | Click any IP or port in Top Talkers to instantly filter the table; click again to remove |
-| **Pagination** | Configurable 50/100/250/500/1000 rows per page |
-| **CSV export** | Exports currently filtered and visible columns |
-| **Print layout** | Optimized for printing (controls hidden) |
+| **Per-column filters** | Wildcard, regex, and negation filters per column (see [Filter Syntax](#filter-syntax)) |
+| **LB toggle** | `LB` button next to search — one-click filter to show only Load Balancer flows (100.64.0.0/10) |
+| **LB badge** | Rows involving NSX LB SNAT IPs display a small blue `LB` tag in the first visible column |
+| **GeoIP flags** | Inline SVG country flags next to public IP addresses (offline, no CDN); fallback to 2-letter code for unknown countries |
+| **GeoIP filter** | Click any flag in the GeoIP stats card to filter the table by country; click again to deselect |
+| **Top Talker click** | Click any value in Top Talkers to set it as a column filter (click again to unset) |
+| **Active filter tags** | Colored tags above the table showing all active filters — click ✕ to remove individual filters |
+| **Drag-and-drop columns** | Reorder columns by dragging headers |
+| **Column visibility** | Show/hide columns via the Columns panel |
+| **Export CSV** | Export the currently visible (filtered) data as CSV |
+| **Pagination** | 100 rows per page with page navigation |
+| **Print layout** | Optimized for printing (controls hidden automatically) |
+| **Reset** | Restores all defaults (column order, visibility, filters, sort, LB toggle, GeoIP filter) |
+| **Print layout** | Optimized for printing (controls hidden automatically) |
 | **Reset** | Restores all defaults (column order, visibility, filters, sort) |
 
 ### Filter Syntax
 
-Filters are entered in the per-column popup (click any column header). All three modes support negation with `!` prefix.
+Filters are entered in the per-column popup (click any column header). All modes support negation with `!` prefix.
 
 | Syntax | Type | Example | Matches |
 |---|---|---|---|
 | `text` | Substring (case-insensitive) | `DROP` | Any cell containing "DROP" |
-| `*pattern*` | Wildcard (`*` = any, `?` = one char) | `10.0.1.*` | All IPs in 10.0.1.x |
+| `*`, `?` | Wildcard (`*` = any chars, `?` = one char) | `10.0.1.*` | All IPs in 10.0.1.x |
 | `/regex/i` | Regular expression | `/^10\.0\./` | IPs starting with 10.0. |
-| `!pattern` | Negation (any type) | `!DROP` | Everything except DROP |
+| `!pattern` | Negation (any of the above) | `!DROP` | Everything except DROP |
 
-**Combined filter examples:**
+**Combined filter examples (filters across columns act as AND):**
 
 | Column | Filter | Result |
 |---|---|---|
-| Src IP | `10.0.1.*` | All flows from 10.0.1.x subnet |
-| Action | `!DROP` | Everything except DROP |
-| Dst Port | `443` | HTTPS traffic |
+| Src IP | `10.0.1.*` | Flows from 10.0.1.x subnet only |
+| Action | `!DROP` | Exclude all DROPs |
+| Dst Port | `443` | HTTPS traffic only |
 | Rule | `!*-PROD-*` | Exclude rules containing "-PROD-" |
-| Dst IP | `/^10\.0\./` | Regex: all IPs starting with 10.0. |
+| Dst IP | `/^10\.0\./` | Destinations starting with 10.0. |
 
 ## Port-to-Service Database
 
@@ -317,48 +359,30 @@ The `dst_service` column maps port numbers to service names using a tiered syste
 
 | Priority | Source | Coverage |
 |---|---|---|
-| 1 | `services-db.csv` (IANA CSV file) | ~6,000 port mappings |
-| 2 | Built-in dictionary | ~270 common ports |
+| 1 | `services-db.csv` (IANA CSV file next to script) | ~6,000 port mappings |
+| 2 | Built-in dictionary (no file needed) | ~270 common ports |
 
 The built-in dictionary covers all well-known services (SSH, HTTP, HTTPS, RDP, DNS, SMTP, MySQL, PostgreSQL, Kubernetes API, Elasticsearch, MongoDB, etc.) and works completely offline.
 
-For comprehensive coverage, download the IANA registry once:
+For comprehensive coverage, download the IANA registry:
 
 ```bash
-wget -O services-db.csv \
-  'https://www.iana.org/assignments/service-names-port-numbers/service-names-port-numbers.csv'
+python3 nsxt_fw_analyzer.py --download-services
 ```
 
-## DNS Resolution
+## GeoIP Country Database
 
-DNS results are persisted in `.dns_ptr_cache.json` next to the script:
+When a `geoip-country.csv` file is present next to the script, the HTML report displays inline SVG country flags next to public IP addresses. Private IPs never show flags. The database is the free [DB-IP Country Lite](https://db-ip.com/db/download/ip-to-country-lite) (CC BY 4.0 license).
 
-```json
-{
-  "10.0.1.5": "web01.example.com",
-  "10.0.2.10": "db-master.internal",
-  "203.0.113.50": ""
-}
+```bash
+python3 nsxt_fw_analyzer.py --download-geoip
 ```
 
-**Resolution flow for each IP:**
+This auto-detects the current month and downloads the correct file (~24 MB). If the current month's release is not published yet, the previous month is used as fallback.
 
-```
-1. Query PRIMARY DNS server
-   ├── PTR found → use hostname, DONE (skip secondary)
-   └── NXDOMAIN / timeout → continue
-2. Query SECONDARY DNS server
-   ├── PTR found → use hostname, DONE
-   └── NXDOMAIN / timeout → store ""
-```
+The HTML report includes ~70 built-in SVG flag definitions covering most countries. For any country without a built-in SVG, a 2-letter country code badge is shown instead. All flags are embedded as base64 data URIs — fully offline, no CDN or internet needed at report viewing time.
 
-This ensures both servers are always consulted when needed — important when different DNS servers are authoritative for different zones.
-
-**Cache behavior:**
-
-- **Non-empty entries** — reused without re-querying
-- **Empty entries** (`""`) — automatically retried on each run (DNS records may have been added since last attempt)
-- Delete the file for a complete fresh start
+If the file is missing, geolocation is silently skipped — no errors, no flags.
 
 ---
 
@@ -366,9 +390,20 @@ This ensures both servers are always consulted when needed — important when di
 
 Standalone helper for bulk DNS PTR cache management. Place it in the same directory as `nsxt_fw_analyzer.py` — both scripts share the same `.dns_ptr_cache.json` file.
 
-## Requirements
+> **Requires:** `pip install dnspython` (or `dnf install python3-dns` on RHEL/Fedora)
 
-- `dnspython` — `pip install dnspython` (or `dnf install python3-dns` on RHEL/Fedora)
+## Commands Executed
+
+| Action | Command | Description |
+|---|---|---|
+| Retry empty | `python3 dns_cache_update.py` | Re-resolve all failed lookups |
+| Full refresh | `python3 dns_cache_update.py --retry-all` | Re-resolve ALL entries from scratch |
+| Add subnet | `python3 dns_cache_update.py --add 10.0.1.0/24` | Resolve entire subnet, skip already cached |
+| Add from file | `python3 dns_cache_update.py --add-file ips.txt` | Bulk add IPs/subnets from text file |
+| Statistics | `python3 dns_cache_update.py --stats` | Show resolution rates and top domains |
+| Cleanup | `python3 dns_cache_update.py --remove-empty` | Delete all unresolved entries |
+| Export | `python3 dns_cache_update.py --export hosts.txt` | Export as `/etc/hosts` format |
+| Preview | `python3 dns_cache_update.py --add 10.0.0.0/16 --dry-run` | Show what would happen |
 
 ## CLI Reference
 
@@ -396,15 +431,11 @@ python3 dns_cache_update.py [OPTIONS]
 | `--stats` | Show cache statistics and top domains |
 | `--remove-empty` | Delete all unresolved entries from cache |
 | `--export FILE` | Export resolved entries as hosts file (`IP\thostname`) |
-| `--dry-run` | Preview what would be resolved without making DNS queries |
+| `--dry-run` | Preview what would be resolved |
 
-## Usage Examples
+## Output
 
-### Retry Failed Lookups
-
-```bash
-python3 dns_cache_update.py
-```
+### Retry
 
 ```
 [LOAD] 450 entries (312 resolved, 138 empty) from .dns_ptr_cache.json
@@ -417,49 +448,7 @@ python3 dns_cache_update.py
 [SAVE] 450 records -> .dns_ptr_cache.json
 ```
 
-### Full Refresh
-
-```bash
-python3 dns_cache_update.py --retry-all
-```
-
-### Add Subnets
-
-```bash
-# Single subnet
-python3 dns_cache_update.py --add 10.0.1.0/24
-
-# Multiple subnets and individual IPs
-python3 dns_cache_update.py --add 10.0.1.0/24 10.0.2.0/24 172.16.0.5
-
-# Large subnet — preview first
-python3 dns_cache_update.py --add 10.0.0.0/16 --dry-run
-```
-
-### Add from File
-
-```bash
-python3 dns_cache_update.py --add-file targets.txt
-```
-
-Example `targets.txt`:
-```
-# Web servers
-10.0.1.0/24
-
-# Database subnet
-10.0.2.0/24
-
-# Individual hosts
-172.16.0.5
-172.16.0.6
-```
-
-### Cache Statistics
-
-```bash
-python3 dns_cache_update.py --stats
-```
+### Statistics
 
 ```
 ==================================================
@@ -477,17 +466,27 @@ python3 dns_cache_update.py --stats
 ==================================================
 ```
 
-### Export & Cleanup
+## Usage Examples
+
+### Add from File
 
 ```bash
-# Export resolved entries as hosts file
-python3 dns_cache_update.py --export hosts.txt
-
-# Remove permanently failed entries
-python3 dns_cache_update.py --remove-empty
+python3 dns_cache_update.py --add-file targets.txt
 ```
 
-## Workflow Examples
+Example `targets.txt`:
+
+```text
+# Web servers
+10.0.1.0/24
+
+# Database subnet
+10.0.2.0/24
+
+# Individual hosts
+172.16.0.5
+172.16.0.6
+```
 
 ### Pre-populate Cache Before Analysis
 
@@ -499,7 +498,7 @@ python3 dns_cache_update.py --add 10.0.0.0/16 10.1.0.0/16
 python3 nsxt_fw_analyzer.py export.tar.gz -m all --resolve-dns --html
 ```
 
-### Periodic Cache Maintenance
+### Periodic Maintenance
 
 ```bash
 # Weekly: retry failed lookups (DNS records may have been added)
@@ -513,6 +512,39 @@ python3 dns_cache_update.py --remove-empty
 ```
 
 ---
+
+## DNS Resolution Logic
+
+Both scripts share the same resolution flow for each IP:
+
+```
+1. Query PRIMARY DNS server
+   ├── PTR found → use hostname, DONE (skip secondary)
+   └── NXDOMAIN / timeout → continue
+2. Query SECONDARY DNS server
+   ├── PTR found → use hostname, DONE
+   └── NXDOMAIN / timeout → store ""
+```
+
+This ensures both servers are always consulted when needed — important when different DNS servers are authoritative for different reverse zones.
+
+### Cache File
+
+DNS results are persisted in `.dns_ptr_cache.json` next to the scripts:
+
+```json
+{
+  "10.0.1.5": "web01.example.com",
+  "10.0.2.10": "db-master.internal",
+  "203.0.113.50": ""
+}
+```
+
+| Value | Meaning | On next run |
+|---|---|---|
+| `"hostname"` | Successfully resolved PTR | Reused from cache |
+| `""` | Lookup attempted, no PTR found | Automatically retried |
+| *(missing)* | Never queried | Resolved on first encounter |
 
 ## Configuration
 
@@ -533,25 +565,26 @@ DNS_TIMEOUT  = 2               # Seconds per query per server
 | HTML report generation | ~0.2 seconds |
 | DNS resolution (per IP, cached) | instant |
 | DNS resolution (per IP, uncached) | 0.1–4 seconds |
-
-The script uses IP classification caching, set-based deduplication, and streaming CSV processing to handle large datasets efficiently.
+| /24 subnet pre-population (254 IPs) | 1–17 minutes |
 
 ## Troubleshooting
 
 | Issue | Solution |
 |---|---|
-| `tarfile` RuntimeWarning on RHEL 9 | Handled automatically (CVE-2007-4559 mitigation) |
+| `tarfile` RuntimeWarning on Python 3.12+ | Handled automatically (CVE-2007-4559 mitigation with fallback) |
 | DNS resolution slow for many IPs | Pre-populate cache with `dns_cache_update.py --add` |
-| Missing service names for ports | Download IANA CSV: `wget -O services-db.csv 'https://...'` |
+| Missing service names for uncommon ports | Run `python3 nsxt_fw_analyzer.py --download-services` |
+| No country flags in HTML report | Run `python3 nsxt_fw_analyzer.py --download-geoip` |
+| GeoIP download: "404 Not Found" for current month | Automatic fallback to previous month; or wait for DB-IP monthly release |
+| Flags show as 2-letter codes, not images | Country not in built-in SVG set (~70 countries); this is expected for rare countries |
 | `--dns-server` has no effect | Install `dnspython` — without it, system resolver is used |
-| `dnspython` not in dnf repos | Try `dnf install python3-dns` (RHEL/Fedora package name) |
+| `dnspython` package not found in dnf | Package name is `python3-dns` on RHEL/Fedora |
 
 ## Requirements
 
 - Python 3.8+
 - No external dependencies for core functionality (CSV output, HTML report, port translation)
 - `dnspython` for custom DNS server support (`pip install dnspython` or `dnf install python3-dns`)
-- `openpyxl` NOT required (this tool works with CSV/tar.gz only)
 
 ## License
 
