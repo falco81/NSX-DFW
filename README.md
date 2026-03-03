@@ -170,7 +170,7 @@ python3 nsxt_fw_analyzer.py logs_export.tar.gz -m all --action DROP
 
 # Outbound traffic, excluding management IPs
 python3 nsxt_fw_analyzer.py logs_export.tar.gz \
-    --direction OUT --exclude-ips 10.0.0.1,10.0.0.2
+    --direction OUT --exclude-ips 10.100.0.1,10.100.0.2
 
 # Exclude using files
 python3 nsxt_fw_analyzer.py logs_export.tar.gz \
@@ -181,10 +181,10 @@ Example `skip_ips.txt`:
 
 ```text
 # Management IPs
-10.0.0.1
-10.0.0.2
+10.100.0.1
+10.100.0.2
 # Monitoring
-10.0.10.50
+10.100.10.50
 ```
 
 ### DNS Resolution
@@ -192,7 +192,7 @@ Example `skip_ips.txt`:
 ```bash
 # With custom DNS servers
 python3 nsxt_fw_analyzer.py logs_export.tar.gz --resolve-dns \
-    --dns-server 10.0.0.53 --dns-server2 10.0.1.53
+    --dns-server 10.100.0.53 --dns-server2 10.100.1.53
 
 # Reuses cached results from previous runs automatically
 python3 nsxt_fw_analyzer.py logs_export.tar.gz --resolve-dns
@@ -214,7 +214,7 @@ python3 nsxt_fw_analyzer.py logs_export.tar.gz \
 ```bash
 python3 nsxt_fw_analyzer.py logs_export.tar.gz \
     -m all --resolve-dns \
-    --dns-server 10.0.0.53 --dns-server2 10.0.1.53 \
+    --dns-server 10.100.0.53 --dns-server2 10.100.1.53 \
     --exclude-ips-file skip_ips.txt --exclude-ports 53,67,68 \
     --action PASS --direction IN --sort-by dst_ip --stats \
     -o full_analysis.csv
@@ -244,7 +244,7 @@ python3 nsxt_fw_analyzer.py --download-all
 │ Format:   HTML
 │ Mode:     all
 │ DNS:      True
-│ DNS srv:  10.0.0.53, 10.0.1.53
+│ DNS srv:  10.100.0.53, 10.100.1.53
 │ Sort:     src_ip
 └──────────────────────────────────────────────┘
 
@@ -263,7 +263,7 @@ python3 nsxt_fw_analyzer.py --download-all
 ─────────────────────────────────────────────
 
 [3/4] DNS PTR resolution...
-[DNS] dnspython -> 10.0.0.53, 10.0.1.53
+[DNS] dnspython -> 10.100.0.53, 10.100.1.53
   Resolving 142 unique IPs...  [142/142]
 
 [4/4] Writing output...
@@ -331,8 +331,6 @@ The `--html` flag generates a fully self-contained HTML file that works offline 
 | **Pagination** | 100 rows per page with page navigation |
 | **Print layout** | Optimized for printing (controls hidden automatically) |
 | **Reset** | Restores all defaults (column order, visibility, filters, sort, LB toggle, GeoIP filter) |
-| **Print layout** | Optimized for printing (controls hidden automatically) |
-| **Reset** | Restores all defaults (column order, visibility, filters, sort) |
 
 ### Filter Syntax
 
@@ -341,19 +339,19 @@ Filters are entered in the per-column popup (click any column header). All modes
 | Syntax | Type | Example | Matches |
 |---|---|---|---|
 | `text` | Substring (case-insensitive) | `DROP` | Any cell containing "DROP" |
-| `*`, `?` | Wildcard (`*` = any chars, `?` = one char) | `10.0.1.*` | All IPs in 10.0.1.x |
-| `/regex/i` | Regular expression | `/^10\.0\./` | IPs starting with 10.0. |
+| `*`, `?` | Wildcard (`*` = any chars, `?` = one char) | `10.100.1.*` | All IPs in 10.100.1.x |
+| `/regex/i` | Regular expression | `/^10\.100\./` | IPs starting with 10.100. |
 | `!pattern` | Negation (any of the above) | `!DROP` | Everything except DROP |
 
 **Combined filter examples (filters across columns act as AND):**
 
 | Column | Filter | Result |
 |---|---|---|
-| Src IP | `10.0.1.*` | Flows from 10.0.1.x subnet only |
+| Src IP | `10.100.1.*` | Flows from 10.100.1.x subnet only |
 | Action | `!DROP` | Exclude all DROPs |
 | Dst Port | `443` | HTTPS traffic only |
 | Rule | `!*-PROD-*` | Exclude rules containing "-PROD-" |
-| Dst IP | `/^10\.0\./` | Destinations starting with 10.0. |
+| Dst IP | `/^10\.100\./` | Destinations starting with 10.100. |
 
 ## Port-to-Service Database
 
@@ -400,12 +398,12 @@ Standalone helper for bulk DNS PTR cache management. Place it in the same direct
 |---|---|---|
 | Retry empty | `python3 dns_cache_update.py` | Re-resolve all failed lookups |
 | Full refresh | `python3 dns_cache_update.py --retry-all` | Re-resolve ALL entries from scratch |
-| Add subnet | `python3 dns_cache_update.py --add 10.0.1.0/24` | Resolve entire subnet, skip already cached |
+| Add subnet | `python3 dns_cache_update.py --add 10.100.1.0/24` | Resolve entire subnet, skip already cached |
 | Add from file | `python3 dns_cache_update.py --add-file ips.txt` | Bulk add IPs/subnets from text file |
 | Statistics | `python3 dns_cache_update.py --stats` | Show resolution rates and top domains |
 | Cleanup | `python3 dns_cache_update.py --remove-empty` | Delete all unresolved entries |
 | Export | `python3 dns_cache_update.py --export hosts.txt` | Export as `/etc/hosts` format |
-| Preview | `python3 dns_cache_update.py --add 10.0.0.0/16 --dry-run` | Show what would happen |
+| Preview | `python3 dns_cache_update.py --add 10.100.0.0/16 --dry-run` | Show what would happen |
 
 ## CLI Reference
 
@@ -428,7 +426,7 @@ python3 dns_cache_update.py [OPTIONS]
 |---|---|
 | *(no flags)* | Retry all empty (failed) entries in cache |
 | `--retry-all` | Re-resolve ALL entries (full refresh) |
-| `--add IP [IP ...]` | Add and resolve IPs or subnets (e.g. `10.0.1.0/24`) |
+| `--add IP [IP ...]` | Add and resolve IPs or subnets (e.g. `10.100.1.0/24`) |
 | `--add-file FILE` | Add and resolve IPs from a text file |
 | `--stats` | Show cache statistics and top domains |
 | `--remove-empty` | Delete all unresolved entries from cache |
@@ -441,10 +439,10 @@ python3 dns_cache_update.py [OPTIONS]
 
 ```
 [LOAD] 450 entries (312 resolved, 138 empty) from .dns_ptr_cache.json
-[DNS] Servers: 10.0.0.53, 10.0.1.53
-[RETRY] Resolving 138 IPs against 10.0.0.53, 10.0.1.53...
-  + 10.0.1.15         -> app-server01.example.com  [10.0.0.53]
-  + 10.0.2.30         -> db-replica.internal        [10.0.1.53]
+[DNS] Servers: 10.100.0.53, 10.100.1.53
+[RETRY] Resolving 138 IPs against 10.100.0.53, 10.100.1.53...
+  + 10.100.1.15        -> app-server01.example.com  [10.100.0.53]
+  + 10.100.2.30        -> db-replica.internal        [10.100.1.53]
   ...
 [RETRY] Done: 45 resolved, 93 empty (12.3s)
 [SAVE] 450 records -> .dns_ptr_cache.json
@@ -480,10 +478,10 @@ Example `targets.txt`:
 
 ```text
 # Web servers
-10.0.1.0/24
+10.100.1.0/24
 
 # Database subnet
-10.0.2.0/24
+10.100.2.0/24
 
 # Individual hosts
 172.16.0.5
@@ -494,7 +492,7 @@ Example `targets.txt`:
 
 ```bash
 # 1. Resolve all IPs in advance
-python3 dns_cache_update.py --add 10.0.0.0/16 10.1.0.0/16
+python3 dns_cache_update.py --add 10.100.0.0/16 10.101.0.0/16
 
 # 2. Run analyzer — DNS lookups will be instant from cache
 python3 nsxt_fw_analyzer.py export.tar.gz -m all --resolve-dns --html
@@ -517,7 +515,7 @@ python3 dns_cache_update.py --remove-empty
 
 # nsx_dfw_doc.py
 
-Interactive HTML documentation generator for NSX-T Distributed Firewall configuration. Connects to the NSX Manager Policy API to fetch all security policies, rules, groups, services, and context profiles, then renders a self-contained dark-themed HTML reference with sidebar navigation, enriched object details, and cross-linking between rules and inventory.
+Interactive HTML documentation generator for NSX-T Distributed Firewall configuration. Connects to the NSX Manager Policy API to fetch all security policies, rules, groups, services, context profiles, and VM inventory, then renders a self-contained dark-themed HTML reference with sidebar navigation, enriched object details, and cross-linking between rules and inventory.
 
 Can also work fully offline from a previously exported JSON file.
 
@@ -527,32 +525,34 @@ Can also work fully offline from a previously exported JSON file.
 
 The script operates in two stages:
 
-1. **Fetch** — connects to NSX Manager via the Policy API (`/policy/api/v1/infra`) and exports DFW domains, security policies, rules, groups, user-defined services, and context profiles into a single JSON file. System-owned objects (built-in NSX services) are excluded from the export but their display names are preserved when referenced by nested service entries.
+1. **Fetch** — connects to NSX Manager via the Policy API (`/policy/api/v1/infra`) and exports DFW domains, security policies, rules, groups, user-defined services, context profiles, and full VM inventory (with tags and power state) into a single JSON file. System-owned objects (built-in NSX services) are excluded from the export but their display names are preserved when referenced by nested service entries.
 
 2. **Generate** — parses the JSON and produces a fully self-contained HTML document. All CSS, JavaScript, and data are embedded — no external dependencies, works offline in any browser.
 
 ## Features
 
 - **Live fetch or offline JSON** — pull directly from NSX Manager or generate from a previously saved JSON export
+- **VM inventory** — full virtual machine database with display names, power state, NSX tags, and group membership; VMs with matching tags are resolved into groups via dynamic condition evaluation
 - **Category-based layout** — policies grouped by DFW processing order (Ethernet → Emergency → Infrastructure → Environment → Application), sorted by `internal_sequence_number` from the API
-- **Dynamic color palette** — category colors assigned automatically from a 10-color palette, no hardcoded assumptions about category names
 - **Sidebar navigation** — auto-width sidebar listing all policies per category with rule counts; click to jump directly to any policy
 - **Full-text search** — search box filters policies, rules, groups, and services across the entire document
 - **Toggle filters** — one-click buttons to hide auto-generated (system-owned) policies and disabled rules
-- **Enriched groups** — rules display group members inline: IP addresses, tag conditions, VM names (truncated UUIDs for ExternalIDExpression), nested expressions with full condition trees, and clickable cross-references to other groups
+- **Enriched groups** — rules display group members inline: IP addresses, tag conditions, VM names (resolved from ExternalIDExpression with clickable links to VM inventory), nested expressions with full condition trees, and clickable cross-references to other groups
 - **Enriched services** — nested service entries (e.g. Microsoft Active Directory V2) are resolved to their constituent service names instead of showing raw `NestedServiceServiceEntry` types
-- **Clickable cross-links** — group names in rules link to the Groups inventory; service names link to the Services inventory
+- **Clickable cross-links** — group names in rules link to the Groups inventory; service names link to the Services inventory; VM names link to the VM inventory
+- **Log Prefix column** — each rule row displays the NSX log label (tag/comment) alongside logging on/off status, providing full visibility into log identification
 - **Rule metadata** — displays rule tags / log labels, logging status, enabled/disabled state, direction, IP protocol, and scope
 - **Groups inventory** — full table of all groups with member types, member details, and rule reference counts; unused groups visually dimmed
 - **Services inventory** — all user-defined services with protocol/port details and rule reference counts
-- **`--filter` option** — generate documentation for a specific project or segment by matching against policy names, group names, and rule tags
+- **VM inventory** — full table of all virtual machines with power state, NSX tags, and group membership
+- **`--filter` / `--filter-tag` options** — generate documentation for a specific project or segment; when active, inventory sections (Groups, Services, VMs) are automatically filtered to show only objects referenced by matching rules, with nested dependencies fully resolved
 - **Fully dynamic** — no hardcoded NSX object names, category names, prefixes, or detection strings; works with any NSX-T environment
 
 ## CLI Reference
 
 ```
-nsx_dfw_doc.py fetch [output.json] [output.html] [--filter TEXT]
-nsx_dfw_doc.py <input.json> [output.html] [--filter TEXT]
+nsx_dfw_doc.py fetch [output.json] [output.html] [--filter TEXT] [--filter-tag TAG]
+nsx_dfw_doc.py <input.json> [output.html] [--filter TEXT] [--filter-tag TAG]
 ```
 
 ### Modes
@@ -566,7 +566,10 @@ nsx_dfw_doc.py <input.json> [output.html] [--filter TEXT]
 
 | Flag | Description |
 |---|---|
-| `--filter TEXT` | Only include policies matching TEXT (case-insensitive) in policy name, source/destination group names, or rule tags |
+| `--filter TEXT` | Match policy names, group names, condition values, effective VM names, and rule tags. Case-insensitive substring match. |
+| `--filter-tag TAG` | Match NSX tag scope/value on VMs and groups. Use colon for AND logic: `--filter-tag zone01:prod` matches VMs/groups whose tags contain both `zone01` and `prod`. |
+
+Both `--filter` and `--filter-tag` can be combined. When combined, a rule matches if it hits either filter (OR logic between the two filters).
 
 ### Output Files
 
@@ -574,7 +577,7 @@ nsx_dfw_doc.py <input.json> [output.html] [--filter TEXT]
 |---|---|---|
 | JSON export | `fetch` mode | `dfw_objects.json` |
 | HTML report | Always | `<json_basename>_documentation.html` |
-| Filtered report | `--filter` used | `<json_basename>_<filter>_documentation.html` |
+| Filtered report | `--filter` / `--filter-tag` used | `<json_basename>_<filter>_documentation.html` |
 
 Filenames can be overridden by passing `.json` and/or `.html` paths as positional arguments.
 
@@ -590,7 +593,7 @@ python3 nsx_dfw_doc.py fetch
 python3 nsx_dfw_doc.py fetch dfw_export.json dfw_report.html
 
 # Fetch and filter in one step
-python3 nsx_dfw_doc.py fetch --filter PROJ-A
+python3 nsx_dfw_doc.py fetch --filter proj-alpha
 ```
 
 ### Generate from Existing JSON
@@ -602,24 +605,64 @@ python3 nsx_dfw_doc.py dfw_objects.json
 # Custom output path
 python3 nsx_dfw_doc.py dfw_objects.json /tmp/dfw_report.html
 
-# Filtered — only policies related to PROJ-A
-python3 nsx_dfw_doc.py dfw_objects.json --filter PROJ-A
+# Filtered — only policies related to proj-alpha
+python3 nsx_dfw_doc.py dfw_objects.json --filter proj-alpha
 
-# Filtered — only policies related to PROJ-B
-python3 nsx_dfw_doc.py dfw_objects.json --filter PROJ-B
+# Filtered — only policies related to proj-beta
+python3 nsx_dfw_doc.py dfw_objects.json --filter proj-beta
+```
+
+### Tag-Based Filtering
+
+```bash
+# Filter by NSX tag — show only policies referencing groups/VMs with tag "zone01"
+python3 nsx_dfw_doc.py dfw_objects.json --filter-tag zone01
+
+# Tag AND logic — both "zone01" and "prod" must be present in the tag
+python3 nsx_dfw_doc.py dfw_objects.json --filter-tag zone01:prod
+
+# Combined text + tag filter
+python3 nsx_dfw_doc.py dfw_objects.json --filter acme --filter-tag zone01
 ```
 
 ### Filter Logic
 
-The `--filter` flag performs case-insensitive matching. A policy is included if any of these conditions are met:
+#### `--filter TEXT`
+
+Case-insensitive substring matching. A policy is included if any of these conditions are met:
 
 | Condition | Behavior |
 |---|---|
 | Policy name contains filter text | All rules of that policy are included |
-| Any rule has source/destination groups whose name contains filter text | Only matching rules are included |
-| Any rule has a tag containing filter text | Only matching rules are included |
+| Rule's source/destination/scope group name or condition value contains filter text | Only matching rules are included |
+| Rule's effective VMs (resolved from group conditions) match filter text | Only matching rules are included |
+| Rule tag contains filter text | Only matching rules are included |
+
+#### `--filter-tag TAG`
+
+Matches against NSX tags on VMs and group tag conditions. Supports AND logic with colon separator.
+
+| Condition | Behavior |
+|---|---|
+| Group has a tag condition whose value contains the tag filter parts | Rule is included |
+| Group's effective VMs have matching NSX tags (scope or value) | Rule is included |
+| VMs directly assigned to group (ExternalID) have matching tags | Rule is included |
 
 This means infrastructure policies that reference project-specific groups are automatically included with the relevant rules, even if the policy name itself does not match.
+
+### Filtered Inventory Sections
+
+When any filter is active (`--filter` and/or `--filter-tag`), the inventory sections at the bottom of the HTML report are automatically scoped to show only objects referenced by the matching rules:
+
+| Section | Unfiltered | Filtered |
+|---|---|---|
+| **Groups** | All groups in the `default` domain | Only groups referenced by filtered rules (source, destination, scope), plus nested group dependencies resolved via PathExpression |
+| **Services** | All user-defined services | Only services referenced by filtered rules, plus nested service dependencies resolved via NestedServiceServiceEntry |
+| **VMs** | All VMs in inventory | Only VMs that are members of referenced groups (ExternalID) or match group conditions (dynamic evaluation). When `--filter-tag` is active, VMs are further restricted to only those whose NSX tags match the tag filter. |
+
+Nested dependency resolution ensures that no referenced objects are accidentally omitted. For example, if a filtered rule references a group that includes other groups via PathExpression, all transitively referenced groups are included. Similarly, if a service bundles sub-services via NestedServiceServiceEntry, those are included as well.
+
+The header of each inventory section shows the filtered count alongside the total, e.g. `45 groups (filtered from 2633 total)`.
 
 ## Output
 
@@ -628,7 +671,7 @@ This means infrastructure policies that reference project-specific groups are au
 ```
 Loading JSON: dfw_objects.json
   Found 60 policies, 316 rules
-  2862 groups, 110 services, 2 profiles
+  2862 groups, 110 services, 2 profiles, 1473 VMs
   Categories: Ethernet, Emergency, Infrastructure, Environment, Application
 HTML documentation written to: dfw_objects_documentation.html
 ```
@@ -638,10 +681,21 @@ With `--filter`:
 ```
 Loading JSON: dfw_objects.json
   Found 60 policies, 316 rules
-  2862 groups, 110 services, 2 profiles
+  2862 groups, 110 services, 2 profiles, 1473 VMs
   Categories: Ethernet, Emergency, Infrastructure, Environment, Application
-  Filter 'PROJ-A': 3 policies, 27 rules matched
-HTML documentation written to: dfw_objects_PROJ-A_documentation.html
+  Filter text='proj-alpha': 3 policies, 27 rules matched
+HTML documentation written to: dfw_objects_proj-alpha_documentation.html
+```
+
+With `--filter-tag`:
+
+```
+Loading JSON: dfw_objects.json
+  Found 60 policies, 316 rules
+  2862 groups, 110 services, 2 profiles, 1473 VMs
+  Categories: Ethernet, Emergency, Infrastructure, Environment, Application
+  Filter tag='zone01': 10 policies, 35 rules matched
+HTML documentation written to: dfw_objects_tag-zone01_documentation.html
 ```
 
 ### HTML Report Structure
@@ -650,13 +704,14 @@ The generated HTML document contains these sections:
 
 | Section | Content |
 |---|---|
-| **Sidebar** | Category headers with color indicators, policy names with rule counts, click-to-navigate |
-| **Header** | Title, filter indicator (if active), global stats (policies, rules, categories) |
+| **Sidebar** | Category headers with color indicators, policy names with rule counts, inventory links with object counts, click-to-navigate |
+| **Header** | Title, filter indicator (if active), global stats (policies, rules, allow/drop/reject/disabled counts, groups, services, VMs) |
 | **Filter bar** | Full-text search, toggle buttons for auto-generated policies and disabled rules |
-| **Policies** | One card per policy: metadata row (category badge, enabled/disabled, scope, rule count), then a rules table |
-| **Rules table** | Columns: Seq, Name, Source, Destination, Services, Profiles, Action, Direction, IP Protocol, Flags |
-| **Groups inventory** | All groups with ID, display name, member types, member details, rule reference count |
-| **Services inventory** | All user-defined services with protocol/port details and rule reference count |
+| **Policies** | One card per policy: metadata row (badges for Stateful/TCP Strict/Locked/Default/Kubernetes, created by, dates, scope), then a rules table |
+| **Rules table** | Columns: Seq, Name, Action, Source, Destination, Services, Direction, Flags, Log Prefix |
+| **Groups inventory** | All groups (or filtered subset) with display name, member types, member details, rule reference count; filter input and Hide Unused toggle |
+| **Services inventory** | All services (or filtered subset) with protocol/port details and rule reference count; filter input |
+| **VM inventory** | All VMs (or filtered subset) with display name, power state, NSX tags, group membership; filter input |
 
 ### Rule Display Details
 
@@ -664,10 +719,11 @@ Each rule row shows:
 
 | Element | Description |
 |---|---|
-| **Source / Destination** | Group display names with clickable links to inventory; inline member detail (IPs, tags, conditions) |
-| **Services** | Service names with clickable links; protocol/port shown on hover; nested services resolved to constituent names |
+| **Source / Destination** | Group display names with clickable links to inventory; inline member detail (IPs, tag conditions, VM names with links to VM inventory, nested expressions) |
+| **Services** | Service names with clickable links; protocol/port shown inline; nested services resolved to constituent names |
 | **Action badge** | Color-coded: green (ALLOW), red (DROP), orange (REJECT) |
-| **Flags** | Logging status with tag label, enabled/disabled state, auto-generated badge for system-owned policies |
+| **Flags** | Logging on/off badge, enabled/disabled state, IP protocol override badge |
+| **Log Prefix** | The NSX log label (tag/comment) configured on the rule — displayed in a dedicated column for easy identification of log entries |
 
 ### Group Member Display
 
@@ -675,12 +731,12 @@ Groups are rendered with full member detail depending on expression type:
 
 | Expression Type | Display |
 |---|---|
-| IPAddressExpression | Comma-separated IP addresses |
+| IPAddressExpression | Comma-separated IP addresses (first 5 shown, remainder as +N count) |
 | Condition | `MemberType Key OPERATOR value` (e.g. `VirtualMachine Tag EQUALS web-tier`) |
 | NestedExpression | Recursive condition tree with AND/OR operators in brackets |
-| PathExpression (groups) | Clickable links to referenced groups |
+| PathExpression (groups) | Clickable links to referenced groups (first 4 shown) |
 | PathExpression (segments) | Segment path names |
-| ExternalIDExpression | Truncated VM UUIDs with count |
+| ExternalIDExpression | VM display names with clickable links to VM inventory (first 5 shown, remainder as +N count) |
 | ConjunctionOperator | `AND` / `OR` between conditions |
 
 ### Nested Service Resolution
@@ -701,15 +757,16 @@ The `fetch` command prompts interactively for hostname, username, and password. 
 
 ## API Endpoints
 
-The script fetches from three NSX Policy API endpoints:
+The script fetches from four NSX API endpoints:
 
 | Endpoint | Objects |
 |---|---|
 | `/policy/api/v1/infra?filter=Type-Service` | User-defined services (system-owned excluded) |
 | `/policy/api/v1/infra?filter=Type-PolicyContextProfile` | User-defined context profiles |
 | `/policy/api/v1/infra?filter=Type-Domain\|Group\|SecurityPolicy\|Rule` | Domains, groups, security policies, rules |
+| `/api/v1/fabric/virtual-machines?page_size=500` | Full VM inventory with tags and power state (paginated) |
 
-All three responses are merged into a single JSON file. TLS certificate verification is disabled (`verify=False`) to support self-signed certificates common in lab and production NSX deployments.
+All responses are merged into a single JSON file. TLS certificate verification is disabled (`verify=False`) to support self-signed certificates common in lab and production NSX deployments.
 
 ## Requirements
 
@@ -740,8 +797,8 @@ DNS results are persisted in `.dns_ptr_cache.json` next to the scripts:
 
 ```json
 {
-  "10.0.1.5": "web01.example.com",
-  "10.0.2.10": "db-master.internal",
+  "10.100.1.5": "web01.example.com",
+  "10.100.2.10": "db-master.internal",
   "203.0.113.50": ""
 }
 ```
@@ -758,8 +815,8 @@ Default DNS servers and timeouts are configured at the top of each script. Edit 
 
 ```python
 # In nsxt_fw_analyzer.py and dns_cache_update.py:
-DNS_SERVER   = "10.0.0.53"     # Primary DNS for PTR lookups
-DNS_SERVER2  = "10.0.1.53"     # Secondary DNS for PTR lookups
+DNS_SERVER   = "10.100.0.53"   # Primary DNS for PTR lookups
+DNS_SERVER2  = "10.100.1.53"   # Secondary DNS for PTR lookups
 DNS_TIMEOUT  = 2               # Seconds per query per server
 ```
 
