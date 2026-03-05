@@ -34,8 +34,9 @@ from pathlib import Path
 # CONFIGURATION
 # =============================================================================
 
-DNS_SERVER     = "10.12.254.11"    # Primary DNS for PTR lookups
-DNS_SERVER2    = "10.12.255.101"   # Secondary DNS for PTR lookups
+DNS_SERVER     = "1.1.1.1"   # Primary DNS for PTR lookups
+DNS_SERVER2    = "2.2.2.2"   # Secondary DNS for PTR lookups
+DNS_SERVER3    = "3.3.3.3"   # Tertiary DNS for PTR lookups
 DNS_TIMEOUT    = 2
 DNS_CACHE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), ".dns_ptr_cache.json"
@@ -560,9 +561,9 @@ def flag_svg_data_uri(cc: str) -> str:
 
 class DnsCache:
     def __init__(self, path=DNS_CACHE_FILE, server=DNS_SERVER,
-                 server2="", timeout=DNS_TIMEOUT):
+                 server2="", server3="", timeout=DNS_TIMEOUT):
         self.path = path
-        self.servers = [s for s in [server, server2] if s]
+        self.servers = [s for s in [server, server2, server3] if s]
         self.timeout = timeout
         self.cache: dict[str, str] = {}
         self._dnspy = False
@@ -1745,6 +1746,11 @@ DESCRIPTION:
                          if it fails, the secondary server is used.
                          Default: 10.12.255.101
 
+  --dns-server3 IP       Tertiary DNS server for PTR queries.
+                         Used as a last resort if both primary and secondary
+                         servers fail to resolve the PTR record.
+                         Default: none
+
   --dns-cache-file PATH  Path to the DNS cache file.
                          Default: .dns_ptr_cache.json (next to the script)
 
@@ -1950,6 +1956,8 @@ def main():
                    help=f"Primary DNS server (default: {DNS_SERVER})")
     d.add_argument("--dns-server2", default=DNS_SERVER2,
                    help=f"Secondary DNS server (default: {DNS_SERVER2})")
+    d.add_argument("--dns-server3", default=DNS_SERVER3,
+                   help=f"Tertiary DNS server (default: {DNS_SERVER3 or 'none'})")
     d.add_argument("--dns-cache-file", default=DNS_CACHE_FILE,
                    help="Cache file path")
     o = p.add_argument_group("Output")
@@ -1987,6 +1995,8 @@ def main():
     dns_srv_display = args.dns_server
     if args.dns_server2:
         dns_srv_display += f", {args.dns_server2}"
+    if args.dns_server3:
+        dns_srv_display += f", {args.dns_server3}"
 
     fmt_label = "HTML" if args.html else "CSV"
     print(f"\n┌─ NSX-T DFW Log Analyzer ─────────────────────┐", file=sys.stderr)
@@ -2027,7 +2037,7 @@ def main():
         if args.resolve_dns:
             print("\n[3/4] DNS PTR resolution...", file=sys.stderr)
             dc = DnsCache(args.dns_cache_file, args.dns_server,
-                          args.dns_server2)
+                          args.dns_server2, args.dns_server3)
             dns_map = resolve_all(ips, dc)
         else:
             print("\n[3/4] DNS skipped (--resolve-dns to enable)", file=sys.stderr)

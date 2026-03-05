@@ -24,8 +24,9 @@ import os
 import sys
 import time
 
-DNS_SERVER   = "10.12.254.11"
-DNS_SERVER2  = "10.12.255.101"
+DNS_SERVER   = "1.1.1.1"
+DNS_SERVER2  = "2.2.2.2"
+DNS_SERVER3  = "3.3.3.3"
 DNS_TIMEOUT  = 2
 DNS_CACHE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), ".dns_ptr_cache.json"
@@ -163,6 +164,8 @@ def main():
                    help=f"Primary DNS (default: {DNS_SERVER})")
     p.add_argument("--dns-server2", default=DNS_SERVER2,
                    help=f"Secondary DNS (default: {DNS_SERVER2})")
+    p.add_argument("--dns-server3", default=DNS_SERVER3,
+                   help=f"Tertiary DNS (default: {DNS_SERVER3 or 'none'})")
     p.add_argument("--timeout", type=int, default=DNS_TIMEOUT,
                    help=f"DNS timeout in seconds (default: {DNS_TIMEOUT})")
     g = p.add_argument_group("Actions")
@@ -209,7 +212,7 @@ def main():
         print(f"[EXPORT] {count} entries -> {args.export}")
         return
     resolvers = setup_resolvers(
-        [args.dns_server, args.dns_server2], args.timeout)
+        [args.dns_server, args.dns_server2, args.dns_server3], args.timeout)
     print(f"[DNS] Servers: {', '.join(s for s,_ in resolvers)}")
     modified = False
     if args.add or args.add_file:
