@@ -602,35 +602,26 @@ def render_group_members_html(members, vm_db=None):
     for m in members:
         if m["type"] == "ip":
             addrs = m["addresses"]
-            if len(addrs) <= 6:
-                parts.append(", ".join(_esc(a) for a in addrs))
-            else:
-                shown = ", ".join(_esc(a) for a in addrs[:5])
-                parts.append(f'{shown} <span class="more-count">+{len(addrs)-5}</span>')
+            parts.append(", ".join(_esc(a) for a in addrs))
         elif m["type"] == "condition":
             parts.append(f'<span class="cond-badge">{_esc(m["member_type"])} {_esc(m["key"])} {_esc(m["operator"])} {_esc(m["value"])}</span>')
         elif m["type"] == "path":
-            for p in m["paths"][:4]:
+            for p in m["paths"]:
                 seg = p.split("/")[-1]
                 parts.append(f'<span class="path-ref">{_esc(seg)}</span>')
-            if len(m["paths"]) > 4:
-                parts.append(f'<span class="more-count">+{len(m["paths"])-4}</span>')
         elif m["type"] == "external_id":
             eids = m.get("external_ids", [])
             if eids and vm_db:
                 vm_names = []
-                for eid in eids[:5]:
+                for eid in eids:
                     if eid in vm_db:
                         vm = vm_db[eid]
                         vm_ips = vm.get("ips", [])
-                        ip_suffix = f' [{", ".join(vm_ips[:3])}{"..." if len(vm_ips)>3 else ""}]' if vm_ips else ""
+                        ip_suffix = f' [{", ".join(vm_ips)}]' if vm_ips else ""
                         vm_names.append(f'<a href="#vm-{_esc(eid)}" class="vm-link" title="{_esc(vm["display_name"])}{_esc(ip_suffix)}">{_esc(vm["display_name"])}{_esc(ip_suffix)}</a>')
                     else:
                         vm_names.append(f'<span class="vm-name" title="{_esc(eid)}">{_esc(eid[:13])}\u2026</span>')
-                shown = ", ".join(vm_names)
-                if len(eids) > 5:
-                    shown += f' <span class="more-count">+{len(eids)-5}</span>'
-                parts.append(shown)
+                parts.append(", ".join(vm_names))
             else:
                 parts.append(f'{_esc(m["member_type"])} &times;{m["count"]}')
         elif m["type"] == "conjunction":
@@ -942,11 +933,9 @@ def _build_vm_section(vm_db, groups_db, is_filtered=False, total_vms=0):
         grps = vm_to_groups.get(eid, [])
         if grps:
             grp_parts = []
-            for g in grps[:5]:
+            for g in grps:
                 grp_parts.append(f'<a href="#grp-{_esc(g["id"])}" class="group-link">{_esc(g["display_name"])}</a>')
             grp_html = ", ".join(grp_parts)
-            if len(grps) > 5:
-                grp_html += f' <span class="more-count">+{len(grps)-5}</span>'
         else:
             grp_html = '<span class="detail-empty">\u2014</span>'
         unused_cls = "" if tags or grps else "group-unused"
