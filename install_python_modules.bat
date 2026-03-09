@@ -1,3 +1,3 @@
 @ECHO OFF
 
-python -m pip install dnspython
+python -m pip install dnspython openpyxl
