@@ -6,13 +6,16 @@ Modes:
   nsx_dfw_doc.py fetch [output.json] [output.html]
       Fetch DFW objects from NSX Manager API and generate HTML documentation.
 
-  nsx_dfw_doc.py <input.json> [output.html] [--filter TEXT] [--filter-tag TAG]
+  nsx_dfw_doc.py <input.json> [output.html] [--filter TEXT] [--filter-tag TAG] [--filter-vm VM1,VM2,...]
       Generate HTML documentation from previously fetched JSON.
 
   --filter TEXT        Match policy names, group names, condition values,
                        effective VM names, rule tags. Case-insensitive.
   --filter-tag TAG     Match NSX tag scope/value. Colon for AND logic:
                        --filter-tag Z00:Prod
+  --filter-vm VM,...   Comma-separated VM display names. Only rules whose
+                       groups contain (or dynamically match) these VMs are
+                       included. Case-insensitive exact match on display_name.
 """
 
 import os
@@ -20,8 +23,18 @@ import sys
 import json
 import html as html_mod
 import getpass
+import base64
+import io
 from datetime import datetime
 from collections import defaultdict, OrderedDict
+
+try:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.comments import Comment
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 DEFAULT_NSX_HOST = 'nsx.example.local'
@@ -36,6 +49,54 @@ CATEGORY_ORDER = [
     "Environment",
     "Application",
 ]
+
+# ─── Built-in NSX system service port definitions ───
+# Fallback for when system-owned services are not in the JSON export.
+# Format: service_id -> list of (type, protocol, ports/info)
+_BUILTIN_SERVICES = {
+    "HTTP":         [("L4", "TCP", ["80"])],
+    "HTTPS":        [("L4", "TCP", ["443"])],
+    "SSH":          [("L4", "TCP", ["22"])],
+    "RDP":          [("L4", "TCP", ["3389"])],
+    "DNS":          [("L4", "TCP", ["53"])],
+    "DNS-UDP":      [("L4", "UDP", ["53"])],
+    "DNS-TCP":      [("L4", "TCP", ["53"])],
+    "SMTP":         [("L4", "TCP", ["25"])],
+    "SMTP_TLS":     [("L4", "TCP", ["587"])],
+    "NTP":          [("L4", "UDP", ["123"])],
+    "NTP_Time_Server": [("L4", "UDP", ["123"])],
+    "MySQL":        [("L4", "TCP", ["3306"])],
+    "MS-SQL-S":     [("L4", "TCP", ["1433"])],
+    "MS-SQL-M":     [("L4", "UDP", ["1434"])],
+    "MS-SQL-M-TCP": [("L4", "TCP", ["1434"])],
+    "Microsoft_SQL_Server": [("L4", "TCP", ["1433"]), ("L4", "UDP", ["1434"])],
+    "ICMP-ALL":     [("ICMP", "ICMPv4", None)],
+    "ICMPv4-ALL":   [("ICMP", "ICMPv4", None)],
+    "LDAP":         [("L4", "TCP", ["389"])],
+    "LDAP-UDP":     [("L4", "UDP", ["389"])],
+    "LDAP-over-SSL": [("L4", "TCP", ["636"])],
+    "LDAP_Global_Catalog": [("L4", "TCP", ["3268"])],
+    "KERBEROS-TCP": [("L4", "TCP", ["88"])],
+    "KERBEROS-UDP": [("L4", "UDP", ["88"])],
+    "MS-DS-TCP":    [("L4", "TCP", ["445"])],
+    "MS_RPC_TCP":   [("ALG", "MS_RPC_TCP", None)],
+    "SOAP":         [("L4", "TCP", ["9389"])],
+    "Active_Directory_Server": [("L4", "TCP", ["464"])],
+    "Active_Directory_Server_UDP": [("L4", "UDP", ["464"])],
+    "Windows-Global-Catalog-over-SSL": [("L4", "TCP", ["3269"])],
+    "Win_2008_-_RPC,_DCOM,_EPM,_DRSUAPI,_NetLogonR,_SamR,_FRS": [("L4", "TCP", ["49152-65535"])],
+    "Microsoft_Active_Directory_V1": [("L4", "TCP", ["88,135,389,445,464,636,3268,3269,9389,49152-65535"]), ("L4", "UDP", ["88,123,389,464"])],
+    "DHCP-Client":  [("L4", "UDP", ["68"])],
+    "DHCP-Server":  [("L4", "UDP", ["67"])],
+    "IMAP":         [("L4", "TCP", ["143"])],
+    "IMAP_SSL":     [("L4", "TCP", ["993"])],
+    "POP3":         [("L4", "TCP", ["110"])],
+    "POP3_SSL":     [("L4", "TCP", ["995"])],
+    "Syslog_(TCP)": [("L4", "TCP", ["514"])],
+    "Syslog_(UDP)": [("L4", "UDP", ["514"])],
+    "IPv6-ICMP_Neighbor_Advertisement": [("ICMP", "ICMPv6", None)],
+    "IPv6-ICMP_Neighbor_Solicitation":  [("ICMP", "ICMPv6", None)],
+}
 
 
 # ─── Helpers ───
@@ -116,6 +177,7 @@ def fetch_nsx_objects(nsx_host=None, username=None, password=None, output_file=N
     services_json = resp.json()
     print(f"    -> {len(services_json.get('children', []))} children received")
     user_defined_services = []
+    system_services = []
     for child in services_json.get("children", []):
         inner_key, inner_obj = _get_inner_object(child)
         if inner_obj is None:
@@ -123,6 +185,11 @@ def fetch_nsx_objects(nsx_host=None, username=None, password=None, output_file=N
         if inner_obj.get("_system_owned") == False:
             inner_obj.pop("children", None)
             user_defined_services.append(child)
+        else:
+            # Keep system services for port resolution but strip bulk data
+            inner_obj.pop("children", None)
+            system_services.append(child)
+    print(f"    -> {len(user_defined_services)} user-defined, {len(system_services)} system")
 
     print("  Fetching profiles ...")
     resp = session.get(nsx_mgr + '/policy/api/v1/infra?filter=Type-PolicyContextProfile')
@@ -146,7 +213,7 @@ def fetch_nsx_objects(nsx_host=None, username=None, password=None, output_file=N
         sys.exit(1)
     dfw_json = resp.json()
     print(f"    -> {len(dfw_json.get('children', []))} children received")
-    dfw_json["children"] = dfw_json["children"] + user_defined_services + user_defined_profiles
+    dfw_json["children"] = dfw_json["children"] + user_defined_services + system_services + user_defined_profiles
 
     # Fetch VM inventory (paginated)
     print("  Fetching virtual machines inventory ...")
@@ -167,10 +234,30 @@ def fetch_nsx_objects(nsx_host=None, username=None, password=None, output_file=N
             break
     print(f"    -> {len(vm_results)} VMs")
 
+    # Fetch VIFs (Virtual Interfaces) for IP addresses (paginated)
+    print("  Fetching virtual interfaces (IP addresses) ...")
+    vif_results = []
+    vif_cursor = None
+    while True:
+        vif_url = nsx_mgr + '/api/v1/fabric/vifs?page_size=500'
+        if vif_cursor:
+            vif_url += f'&cursor={vif_cursor}'
+        resp = session.get(vif_url)
+        if resp.status_code != 200:
+            print(f"    WARNING: VIF fetch failed (HTTP {resp.status_code}), skipping")
+            break
+        vif_data = resp.json()
+        vif_results.extend(vif_data.get('results', []))
+        vif_cursor = vif_data.get('cursor')
+        if not vif_cursor:
+            break
+    print(f"    -> {len(vif_results)} VIFs")
+
     # Store VM inventory alongside infra data
     export_data = {
         "infra": dfw_json,
         "virtual_machines": vm_results,
+        "virtual_interfaces": vif_results,
     }
 
     with open(output_file, "w", encoding="utf-8") as f:
@@ -178,7 +265,7 @@ def fetch_nsx_objects(nsx_host=None, username=None, password=None, output_file=N
 
     print(f"  Export complete: {len(user_defined_services)} services, "
           f"{len(user_defined_profiles)} profiles, "
-          f"{len(vm_results)} VMs, "
+          f"{len(vm_results)} VMs, {len(vif_results)} VIFs, "
           f"{len(dfw_json['children'])} total children")
     print(f"  Written to: {output_file}")
     return output_file
@@ -197,20 +284,44 @@ def parse_json(filepath):
     if "infra" in raw:
         data = raw["infra"]
         vm_list = raw.get("virtual_machines", [])
+        vif_list = raw.get("virtual_interfaces", [])
     else:
         data = raw
         vm_list = []
+        vif_list = []
 
-    # Build VM database: external_id -> {display_name, tags, power_state}
+    # Build VIF IP mapping: owner_vm_id -> list of IPs
+    vif_ips = defaultdict(list)
+    for vif in vif_list:
+        owner = vif.get("owner_vm_id", "")
+        if not owner:
+            continue
+        for info in vif.get("ip_address_info", []):
+            # Try both formats: ip_addresses (array) and ip_address (string)
+            addrs = info.get("ip_addresses", [])
+            if not addrs:
+                addr = info.get("ip_address", "")
+                if addr:
+                    addrs = [addr]
+            for addr in addrs:
+                if addr and not addr.startswith("fe80:") and ":" not in addr:
+                    vif_ips[owner].append(addr)
+
+    # Build VM database: external_id -> {display_name, tags, power_state, os, ips}
     vm_db = {}
     for vm in vm_list:
         eid = vm.get("external_id", "")
         if eid:
+            guest = vm.get("guest_info", {})
+            ips = vif_ips.get(eid, [])
             vm_db[eid] = {
                 "display_name": vm.get("display_name", ""),
                 "tags": vm.get("tags", []),
                 "power_state": vm.get("power_state", ""),
                 "host_id": vm.get("host_id", ""),
+                "os_name": guest.get("os_name", ""),
+                "computer_name": guest.get("computer_name", ""),
+                "ips": ips,
             }
 
     policies = []      # flat list of policy dicts (normalized)
@@ -260,6 +371,48 @@ def parse_json(filepath):
     else:
         print(f"  {len(groups)} groups, {len(services)} services, {len(profiles)} profiles")
     print(f"  Categories: {', '.join(ordered.keys())}")
+
+    # Inject built-in service definitions for any referenced but missing services
+    # Collect all service paths referenced by rules and nested entries
+    _referenced_svc_paths = set()
+    for rlist in rules_by_policy.values():
+        for r in rlist:
+            for sp in r.get("services", []):
+                if sp != "ANY":
+                    _referenced_svc_paths.add(sp)
+    for svc in services.values():
+        for entry in svc["entries"]:
+            if entry.get("type") == "nested_svc":
+                ref = entry.get("nested_service_path", "")
+                if ref:
+                    _referenced_svc_paths.add(ref)
+
+    # Fill missing services from built-in dictionary
+    _injected = 0
+    for sp in _referenced_svc_paths:
+        if sp in services:
+            continue
+        svc_id = sp.split("/")[-1] if "/" in sp else sp
+        if svc_id in _BUILTIN_SERVICES:
+            entries = []
+            for etype, proto, ports in _BUILTIN_SERVICES[svc_id]:
+                if etype == "L4":
+                    entries.append({"type": "L4", "protocol": proto, "dst_ports": ports, "src_ports": []})
+                elif etype == "ICMP":
+                    entries.append({"type": "ICMP", "protocol": proto, "icmp_type": None, "icmp_code": None})
+                elif etype == "ALG":
+                    entries.append({"type": "ALG", "alg": proto, "dst_ports": []})
+            display = svc_id.replace("_", " ")
+            services[sp] = {
+                "id": svc_id,
+                "display_name": display,
+                "path": sp,
+                "entries": entries,
+                "_system_owned": True,
+            }
+            _injected += 1
+    if _injected:
+        print(f"  Injected {_injected} built-in service definitions")
 
     # Resolve nested service references
     for svc in services.values():
@@ -379,6 +532,7 @@ def _parse_service(obj, services):
         "display_name": obj.get("display_name", ""),
         "path": svc_path,
         "entries": entries,
+        "_system_owned": bool(obj.get("_system_owned", False)),
     }
 
 
@@ -467,7 +621,10 @@ def render_group_members_html(members, vm_db=None):
                 vm_names = []
                 for eid in eids[:5]:
                     if eid in vm_db:
-                        vm_names.append(f'<a href="#vm-{_esc(eid)}" class="vm-link" title="{_esc(eid)}">{_esc(vm_db[eid]["display_name"])}</a>')
+                        vm = vm_db[eid]
+                        vm_ips = vm.get("ips", [])
+                        ip_suffix = f' [{", ".join(vm_ips[:3])}{"..." if len(vm_ips)>3 else ""}]' if vm_ips else ""
+                        vm_names.append(f'<a href="#vm-{_esc(eid)}" class="vm-link" title="{_esc(vm["display_name"])}{_esc(ip_suffix)}">{_esc(vm["display_name"])}{_esc(ip_suffix)}</a>')
                     else:
                         vm_names.append(f'<span class="vm-name" title="{_esc(eid)}">{_esc(eid[:13])}\u2026</span>')
                 shown = ", ".join(vm_names)
@@ -491,6 +648,142 @@ def render_group_members_html(members, vm_db=None):
             else:
                 parts.append('<span class="cond-badge">Nested</span>')
     return " ".join(parts)
+
+
+def _format_group_detail(g, vm_db=None):
+    """Return detail string for a single group: IPs, VM names, or conditions."""
+    if vm_db is None:
+        vm_db = {}
+    members = g.get("members", [])
+    if not members:
+        return ""
+
+    # Collect parts by type
+    ip_list = []
+    vm_names = []
+    conditions = []
+
+    for m in members:
+        if m["type"] == "ip":
+            ip_list.extend(m.get("addresses", []))
+        elif m["type"] == "external_id":
+            for eid in m.get("external_ids", []):
+                if eid in vm_db:
+                    vm_names.append(vm_db[eid]["display_name"])
+                else:
+                    vm_names.append(eid[:12] + "\u2026")
+        elif m["type"] == "condition":
+            conditions.append(f'{m["member_type"]} {m["key"]} {m["operator"]} {m["value"]}')
+        elif m["type"] == "conjunction":
+            conditions.append(m.get("operator", "OR"))
+        elif m["type"] == "nested":
+            for ne in m.get("expressions", []):
+                if ne["type"] == "condition":
+                    conditions.append(f'{ne["member_type"]} {ne["key"]} {ne["operator"]} {ne["value"]}')
+                elif ne["type"] == "conjunction":
+                    conditions.append(ne.get("operator", "AND"))
+
+    # Format output — show all IPs/VMs for comments
+    if ip_list:
+        return ", ".join(ip_list)
+    elif vm_names:
+        # Enrich VM names with their IPs
+        enriched = []
+        for m in members:
+            if m["type"] != "external_id":
+                continue
+            for eid in m.get("external_ids", []):
+                if eid in vm_db:
+                    vm = vm_db[eid]
+                    vm_ips = vm.get("ips", [])
+                    if vm_ips:
+                        enriched.append(f'{vm["display_name"]} [{", ".join(vm_ips)}]')
+                    else:
+                        enriched.append(vm["display_name"])
+                else:
+                    enriched.append(eid[:12] + "\u2026")
+        return ", ".join(enriched) if enriched else ", ".join(vm_names)
+    elif conditions:
+        return " ".join(conditions)
+    return ""
+
+
+def _format_groups_comment(group_paths, groups_db, vm_db=None):
+    """Build comment text for group paths — one group per line with detail."""
+    if not group_paths or group_paths == ["ANY"]:
+        return ""
+    lines = []
+    for path in group_paths:
+        if path == "ANY":
+            continue
+        if path not in groups_db:
+            continue
+        g = groups_db[path]
+        display = g.get("display_name", path.split("/")[-1])
+        detail = _format_group_detail(g, vm_db)
+        if detail:
+            lines.append(f"{display}\n  {detail}")
+    return "\n".join(lines) if lines else ""
+
+
+def _format_groups_text(group_paths, groups_db, vm_db=None):
+    """Format list of group paths into plain text for Excel export."""
+    if not group_paths or group_paths == ["ANY"]:
+        return "ANY"
+    parts = []
+    for path in group_paths:
+        if path == "ANY":
+            parts.append("ANY")
+            continue
+        name = extract_name_from_path(path)
+        if path in groups_db:
+            parts.append(groups_db[path].get("display_name", name))
+        else:
+            parts.append(name)
+    return "\n".join(parts) if len(parts) > 1 else ", ".join(parts)
+
+
+def _format_services_comment(svc_paths, services_db):
+    """Build comment text for services — name, type badge, and ports."""
+    if not svc_paths or svc_paths == ["ANY"]:
+        return ""
+    lines = []
+    for path in svc_paths:
+        if path == "ANY":
+            continue
+        if path not in services_db:
+            continue
+        svc = services_db[path]
+        is_sys = svc.get("_system_owned", False)
+        badge = "[NSX]" if is_sys else "[Custom]"
+        display = svc.get("display_name", path.split("/")[-1])
+        port_str = _format_service_entries_compact(svc["entries"])
+        if port_str:
+            lines.append(f"{badge} {display}\n  {port_str}")
+        else:
+            lines.append(f"{badge} {display}")
+    return "\n".join(lines) if lines else ""
+
+
+def _format_services_text(svc_paths, services_db):
+    """Format list of service paths into plain text for Excel export."""
+    if not svc_paths or svc_paths == ["ANY"]:
+        return "ANY"
+    parts = []
+    for path in svc_paths:
+        if path == "ANY":
+            parts.append("ANY")
+            continue
+        if path in services_db:
+            svc = services_db[path]
+            port_str = _format_service_entries_compact(svc["entries"])
+            if port_str:
+                parts.append(port_str)
+            else:
+                parts.append(svc.get("display_name", path.split("/")[-1]))
+        else:
+            parts.append(path.split("/")[-1] if "/" in path else path)
+    return " | ".join(parts)
 
 
 def format_groups(group_paths, groups_db, vm_db=None):
@@ -533,12 +826,24 @@ def format_services(svc_paths, services_db):
             port_str = _format_service_entries_compact(svc["entries"])
             display = svc.get("display_name", seg)
             svc_id = svc.get("id", seg)
-            parts.append(
-                f'<span class="svc-enriched" title="{_esc(port_str)}">'
-                f'<a href="#svc-{_esc(svc_id)}" class="svc-link">{_esc(display)}</a>'
-                f'<span class="svc-ports">{_esc(port_str)}</span>'
-                f'</span>'
-            )
+            is_sys = svc.get("_system_owned", False)
+            link_cls = "svc-link svc-sys" if is_sys else "svc-link"
+            badge = '<span class="svc-badge-sys">NSX</span>' if is_sys else ""
+            if is_sys:
+                # System service — no inventory link, just display
+                parts.append(
+                    f'<span class="svc-enriched" title="{_esc(port_str)}">'
+                    f'<span class="{link_cls}">{_esc(display)}</span>{badge}'
+                    f'<span class="svc-ports">{_esc(port_str)}</span>'
+                    f'</span>'
+                )
+            else:
+                parts.append(
+                    f'<span class="svc-enriched" title="{_esc(port_str)}">'
+                    f'<a href="#svc-{_esc(svc_id)}" class="{link_cls}">{_esc(display)}</a>{badge}'
+                    f'<span class="svc-ports">{_esc(port_str)}</span>'
+                    f'</span>'
+                )
         else:
             parts.append(f'<span class="svc-name">{_esc(seg)}</span>')
     return " ".join(parts)
@@ -566,12 +871,13 @@ def _format_service_entries_compact(entries):
             name = e.get("display_name", "")
             resolved = e.get("resolved_entries")
             if resolved:
-                parts.append(f'{name}({_format_service_entries_compact(resolved)})')
+                resolved_str = _format_service_entries_compact(resolved)
+                parts.append(f'[{name}]({resolved_str})')
             else:
                 parts.append(name)
         else:
             parts.append(e["type"])
-    return ", ".join(parts) if parts else ""
+    return " | ".join(parts) if parts else ""
 
 
 # ─── HTML generation ───
@@ -602,7 +908,7 @@ def _build_vm_section(vm_db, groups_db, is_filtered=False, total_vms=0):
     lines.append('  </div>')
     lines.append('  <div class="rules-table-wrap">')
     lines.append('  <table class="rules-table" id="vmTable">')
-    lines.append('    <thead><tr><th>VM Name</th><th>Power</th><th>Tags</th><th>Groups</th></tr></thead>')
+    lines.append('    <thead><tr><th>VM Name</th><th>IP Address</th><th>OS</th><th>Power</th><th>Tags</th><th>Groups</th></tr></thead>')
     lines.append('    <tbody>')
     for eid in sorted(vm_db.keys(), key=lambda e: vm_db[e]["display_name"].lower()):
         vm = vm_db[eid]
@@ -610,6 +916,19 @@ def _build_vm_section(vm_db, groups_db, is_filtered=False, total_vms=0):
         power = vm.get("power_state", "")
         power_cls = "action-allow" if power == "VM_RUNNING" else "action-drop" if power == "VM_STOPPED" else ""
         power_short = power.replace("VM_", "").lower() if power else "\u2014"
+        # IP addresses
+        ips = vm.get("ips", [])
+        if ips:
+            ip_html = '<span class="vm-ip">' + ", ".join(_esc(ip) for ip in ips) + '</span>'
+        else:
+            ip_html = '<span class="detail-empty">\u2014</span>'
+        # OS
+        os_name = vm.get("os_name", "")
+        if os_name:
+            os_short = os_name.replace(" (64-bit)", "").replace(" (32-bit)", "").replace("Microsoft ", "")
+            os_html = f'<span class="vm-os" title="{_esc(os_name)}">{_esc(os_short)}</span>'
+        else:
+            os_html = '<span class="detail-empty">\u2014</span>'
         if tags:
             tag_parts = []
             for t in tags:
@@ -633,6 +952,8 @@ def _build_vm_section(vm_db, groups_db, is_filtered=False, total_vms=0):
         unused_cls = "" if tags or grps else "group-unused"
         lines.append(f'    <tr class="{unused_cls}" id="vm-{_esc(eid)}">')
         lines.append(f'      <td class="col-name"><a href="#vm-{_esc(eid)}" class="vm-link" title="{_esc(eid)}">{_esc(vm["display_name"])}</a></td>')
+        lines.append(f'      <td>{ip_html}</td>')
+        lines.append(f'      <td>{os_html}</td>')
         lines.append(f'      <td><span class="{power_cls}">{_esc(power_short)}</span></td>')
         lines.append(f'      <td>{tag_html}</td>')
         lines.append(f'      <td>{grp_html}</td>')
@@ -641,8 +962,114 @@ def _build_vm_section(vm_db, groups_db, is_filtered=False, total_vms=0):
     return "\n".join(lines) + "\n"
 
 
+def _build_xlsx_base64(excel_rows, title):
+    """Build a proper .xlsx file in memory and return base64-encoded string."""
+    if not HAS_OPENPYXL or not excel_rows:
+        return None
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "DFW Rules"
+
+    # Styles
+    thin_border = Border(
+        bottom=Side(style='thin', color='2a2e3a'),
+    )
+    hdr_font = Font(name='Calibri', size=11, bold=True)
+    hdr_fill = PatternFill('solid', fgColor='1a1e28')
+    hdr_font_white = Font(name='Calibri', size=11, bold=True, color='e2e4ea')
+    pol_font = Font(name='Calibri', size=11, bold=True, color='4a90d9')
+    pol_fill = PatternFill('solid', fgColor='f0f4fa')
+    allow_font = Font(name='Calibri', size=10, color='1a7a4a')
+    drop_font = Font(name='Calibri', size=10, color='c0392b')
+    reject_font = Font(name='Calibri', size=10, color='d68910')
+    disabled_font = Font(name='Calibri', size=10, color='888888', italic=True)
+    default_font = Font(name='Calibri', size=10)
+
+    # Column widths
+    col_widths = {'A': 16, 'B': 38, 'C': 6, 'D': 32, 'E': 9, 'F': 45, 'G': 45, 'H': 50, 'I': 8, 'J': 5, 'K': 9, 'L': 38}
+    for col, width in col_widths.items():
+        ws.column_dimensions[col].width = width
+
+    # Header
+    headers = ['Category', 'Policy', 'Seq', 'Rule Name', 'Action', 'Source', 'Destination', 'Services', 'Dir', 'Log', 'Disabled', 'Log Prefix']
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = hdr_font_white
+        cell.fill = hdr_fill
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+    ws.freeze_panes = 'A2'
+    ws.auto_filter.ref = f"A1:L{len(excel_rows) + 1}"
+
+    last_policy = ""
+    for r in excel_rows:
+        # Policy separator row
+        if r["policy"] != last_policy:
+            last_policy = r["policy"]
+            sep_row = [r["cat"], r["policy"], "", "", "", "", "", "", "", "", "", ""]
+            ws.append(sep_row)
+            row_num = ws.max_row
+            for cell in ws[row_num]:
+                cell.font = pol_font
+                cell.fill = pol_fill
+
+        # Data row
+        row_data = [
+            r["cat"], r["policy"], r["seq"], r["name"], r["action"],
+            r["src"], r["dst"], r["svc"], r["dir"],
+            "Yes" if r["logged"] else "No",
+            "Yes" if r["disabled"] else "No",
+            r["log_prefix"],
+        ]
+        ws.append(row_data)
+        row_num = ws.max_row
+
+        # Apply style based on action/disabled
+        if r["disabled"]:
+            font = disabled_font
+        elif r["action"] == "ALLOW":
+            font = allow_font
+        elif r["action"] == "DROP":
+            font = drop_font
+        elif r["action"] == "REJECT":
+            font = reject_font
+        else:
+            font = default_font
+
+        for cell in ws[row_num]:
+            cell.font = font
+            cell.border = thin_border
+            cell.alignment = Alignment(vertical='top', wrap_text=bool(cell.value and '\n' in str(cell.value)))
+
+        # Add comments with group details to Source (F) and Destination (G)
+        src_comment = r.get("src_comment", "")
+        dst_comment = r.get("dst_comment", "")
+        if src_comment:
+            c = Comment(src_comment, "NSX DFW")
+            c.width = 350
+            c.height = max(60, min(400, 20 * src_comment.count('\n') + 40))
+            ws.cell(row=row_num, column=6).comment = c
+        if dst_comment:
+            c = Comment(dst_comment, "NSX DFW")
+            c.width = 350
+            c.height = max(60, min(400, 20 * dst_comment.count('\n') + 40))
+            ws.cell(row=row_num, column=7).comment = c
+        svc_comment = r.get("svc_comment", "")
+        if svc_comment:
+            c = Comment(svc_comment, "NSX DFW")
+            c.width = 400
+            c.height = max(60, min(400, 20 * svc_comment.count('\n') + 40))
+            ws.cell(row=row_num, column=8).comment = c
+
+    # Save to buffer
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode('ascii')
+
+
 def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
-                  groups_db, services_db, profiles_db, vm_db=None, filter_text=None, filter_tag=None):
+                  groups_db, services_db, profiles_db, vm_db=None, filter_text=None, filter_tag=None, filter_vm=None):
 
     total_policies = sum(len(v) for v in ordered_categories.values())
     total_rules = sum(len(v) for v in rules_by_policy.values())
@@ -722,7 +1149,8 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
 
     # Collect referenced VMs (from groups that are in the filtered set)
     referenced_vms = set()
-    if filter_text and vm_db:
+    has_filter = bool(filter_text or filter_tag or filter_vm)
+    if has_filter and vm_db:
         for gpath in referenced_groups:
             g = groups_db.get(gpath)
             if not g:
@@ -738,6 +1166,7 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
     nav_html = ""
     content_html = ""
     policy_idx = 0
+    excel_rows = []  # Collect data for Excel export
 
     for cat, cat_policies in ordered_categories.items():
         color = category_colors.get(cat, "#8b5cf6")
@@ -847,6 +1276,27 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
                         content_html += f'      <td class="col-logprefix"><span class="detail-empty">\u2014</span></td>\n'
                     content_html += f'    </tr>\n'
 
+                    # Collect data for Excel export
+                    src_groups = r.get("source_groups", ["ANY"])
+                    dst_groups = r.get("destination_groups", ["ANY"])
+                    excel_rows.append({
+                        "cat": cat,
+                        "policy": display_name,
+                        "seq": str(seq),
+                        "name": r_name,
+                        "action": action,
+                        "src": _format_groups_text(src_groups, groups_db, vm_db),
+                        "dst": _format_groups_text(dst_groups, groups_db, vm_db),
+                        "src_comment": _format_groups_comment(src_groups, groups_db, vm_db),
+                        "dst_comment": _format_groups_comment(dst_groups, groups_db, vm_db),
+                        "svc": _format_services_text(r.get("services", ["ANY"]), services_db),
+                        "svc_comment": _format_services_comment(r.get("services", ["ANY"]), services_db),
+                        "dir": r.get("direction", ""),
+                        "logged": logged,
+                        "disabled": disabled,
+                        "log_prefix": log_prefix,
+                    })
+
                 content_html += '    </tbody></table></div>\n'
             else:
                 content_html += '  <div class="no-rules">No rules</div>\n'
@@ -864,20 +1314,23 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
     ref_groups = {p: g for p, g in default_groups.items() if p in referenced_groups}
 
     # When filter is active, only show referenced groups (with nested deps)
-    if filter_text:
+    if has_filter:
         display_groups = ref_groups
     else:
         display_groups = default_groups
 
     # Pre-calculate display_services for nav counts
-    ref_svc_count = len(referenced_services & set(services_db.keys()))
-    if filter_text:
-        display_services = {p: s for p, s in services_db.items() if p in referenced_services}
+    # services_db contains ALL services (system + user) for port resolution
+    # display_services is for inventory: only user-defined services
+    user_services_db = {p: s for p, s in services_db.items() if not s.get("_system_owned")}
+    ref_svc_count = len(referenced_services & set(user_services_db.keys()))
+    if has_filter:
+        display_services = {p: s for p, s in user_services_db.items() if p in referenced_services}
     else:
-        display_services = services_db
+        display_services = user_services_db
 
     # Pre-calculate display_vm_db for nav counts
-    if filter_text and vm_db and referenced_vms:
+    if has_filter and vm_db and referenced_vms:
         display_vm_db = {eid: vm for eid, vm in vm_db.items() if eid in referenced_vms}
     else:
         display_vm_db = vm_db if vm_db else {}
@@ -888,12 +1341,18 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
         display_vm_db = {eid: vm for eid, vm in display_vm_db.items()
                          if _vm_tag_matches(vm, tag_parts)}
 
+    # When filter_vm is active, further restrict VMs to only those whose name matches
+    if filter_vm and vm_db:
+        vm_name_set = {n.strip().lower() for n in filter_vm.split(",") if n.strip()}
+        display_vm_db = {eid: vm for eid, vm in display_vm_db.items()
+                         if vm.get("display_name", "").lower() in vm_name_set}
+
     groups_nav += '<div class="nav-category" style="--cat-color: #a78bfa">\n'
     groups_nav += '  <div class="nav-cat-label">Inventory</div>\n'
     groups_nav += f'  <a class="nav-policy" href="#groups-inventory">Groups ({len(display_groups)})</a>\n'
     groups_nav += f'  <a class="nav-policy" href="#services-inventory">Services ({len(display_services)})</a>\n'
     if vm_db:
-        if filter_text or filter_tag:
+        if has_filter:
             groups_nav += f'  <a class="nav-policy" href="#vm-inventory">VMs ({len(display_vm_db)} filtered)</a>\n'
         else:
             tagged_vm_count = sum(1 for vm in vm_db.values() if vm.get("tags"))
@@ -904,7 +1363,7 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
     groups_section += '  <div class="category-header" style="--cat-color: #a78bfa">\n'
     groups_section += '    <span class="cat-dot" style="background: #a78bfa"></span>\n'
     groups_section += f'    <h2>Groups</h2>\n'
-    if filter_text:
+    if has_filter:
         groups_section += f'    <span class="cat-count">{len(display_groups)} groups (filtered from {len(default_groups)} total)</span>\n'
     else:
         groups_section += f'    <span class="cat-count">{len(default_groups)} groups ({len(ref_groups)} used in rules)</span>\n'
@@ -954,10 +1413,10 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
     services_section += '  <div class="category-header" style="--cat-color: #a78bfa">\n'
     services_section += '    <span class="cat-dot" style="background: #a78bfa"></span>\n'
     services_section += f'    <h2>Services</h2>\n'
-    if filter_text:
-        services_section += f'    <span class="cat-count">{len(display_services)} services (filtered from {len(services_db)} total)</span>\n'
+    if has_filter:
+        services_section += f'    <span class="cat-count">{len(display_services)} services (filtered from {len(user_services_db)} total)</span>\n'
     else:
-        services_section += f'    <span class="cat-count">{len(services_db)} services ({ref_svc_count} used in rules)</span>\n'
+        services_section += f'    <span class="cat-count">{len(user_services_db)} services ({ref_svc_count} used in rules)</span>\n'
     services_section += '  </div>\n'
     services_section += '  <div class="filter-bar">\n'
     services_section += '    <input type="text" id="svcSearchInput" placeholder="Filter services..." oninput="filterServices()" />\n'
@@ -984,9 +1443,24 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
 
     services_section += '    </tbody></table></div></div>\n'
 
-    vm_section = _build_vm_section(display_vm_db, groups_db, is_filtered=bool(filter_text or filter_tag), total_vms=len(vm_db) if vm_db else 0)
+    vm_section = _build_vm_section(display_vm_db, groups_db, is_filtered=has_filter, total_vms=len(vm_db) if vm_db else 0)
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Build Excel export data
+    excel_base = os.path.splitext(os.path.basename(output_path))[0]
+    xlsx_b64 = _build_xlsx_base64(excel_rows, excel_base)
+    if xlsx_b64:
+        excel_data_json = json.dumps(xlsx_b64)
+        excel_title_json = json.dumps(excel_base, ensure_ascii=False)
+        excel_mode = "xlsx"
+    else:
+        if not HAS_OPENPYXL:
+            print("  WARNING: 'openpyxl' not installed — Excel export disabled in HTML report")
+            print("           Install with: pip install openpyxl")
+        excel_data_json = '""'
+        excel_title_json = json.dumps(excel_base, ensure_ascii=False)
+        excel_mode = "none"
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1096,6 +1570,8 @@ body {{ font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; background
 .group-link:hover {{ color: var(--text-bright); border-bottom-color: var(--text-bright); }}
 .svc-link {{ font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; font-size: 11px; color: var(--purple); text-decoration: none; border-bottom: 1px dotted rgba(167,139,250,0.4); cursor: pointer; }}
 .svc-link:hover {{ color: var(--text-bright); border-bottom-color: var(--text-bright); }}
+.svc-link.svc-sys {{ color: var(--text-dim); border-bottom: none; cursor: default; }}
+.svc-badge-sys {{ display: inline-block; font-size: 8px; font-weight: 600; padding: 0px 3px; border-radius: 3px; margin-left: 3px; vertical-align: middle; background: rgba(139,144,160,0.12); color: var(--text-dim); letter-spacing: 0.3px; text-transform: uppercase; }}
 .group-detail {{ display: block; font-size: 10px; color: var(--text-dim); font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; max-width: 300px; line-height: 1.6; margin-top: 1px; }}
 .group-detail .more-count {{ color: var(--accent); font-size: 9px; }}
 .group-detail .cond-badge {{ background: rgba(251,191,36,0.1); color: var(--amber); padding: 1px 4px; border-radius: 3px; font-size: 9px; }}
@@ -1105,6 +1581,8 @@ body {{ font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; background
 .vm-name {{ font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; font-size: 11px; color: #93c5fd; }}
 .vm-link {{ font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; font-size: 11px; color: #93c5fd; text-decoration: none; border-bottom: 1px dotted rgba(147,197,253,0.4); cursor: pointer; }}
 .vm-link:hover {{ color: var(--text-bright); border-bottom-color: var(--text-bright); }}
+.vm-ip {{ font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; font-size: 11px; color: var(--green); }}
+.vm-os {{ font-size: 10px; color: var(--text-dim); }}
 
 .svc-enriched {{ display: inline-block; margin: 2px 0; }}
 .svc-ports {{ display: block; font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; font-size: 10px; color: var(--green); line-height: 1.4; }}
@@ -1156,6 +1634,7 @@ tr.group-unused:hover {{ opacity: 0.8; }}
     <input type="text" id="searchInput" placeholder="Search rules, policies, groups..." oninput="filterContent()" />
     <button class="filter-btn" onclick="toggleWcp(this)">Hide Kubernetes</button>
     <button class="filter-btn" onclick="toggleDisabled(this)">Hide disabled</button>
+    {'<button class="filter-btn" onclick="exportExcel()" title="Export rules to Excel (.xlsx)">Export Excel</button>' if excel_mode == 'xlsx' else '<button class="filter-btn" disabled style="opacity:0.3;cursor:not-allowed" title="openpyxl not installed — run: pip install openpyxl">Export Excel (N/A)</button>'}
   </div>
 
   {content_html}
@@ -1217,6 +1696,22 @@ function filterServices() {{
   table.querySelectorAll('tbody tr').forEach(row=>{{
     row.style.display=(!ql||row.textContent.toLowerCase().includes(ql))?'':'none';
   }});
+}}
+</script>
+<script>
+var _xlsData={excel_data_json};
+var _xlsTitle={excel_title_json};
+function exportExcel(){{
+  if(!_xlsData)return;
+  var raw=atob(_xlsData);
+  var arr=new Uint8Array(raw.length);
+  for(var i=0;i<raw.length;i++)arr[i]=raw.charCodeAt(i);
+  var blob=new Blob([arr],{{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}});
+  var a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=_xlsTitle+'.xlsx';
+  a.click();
+  URL.revokeObjectURL(a.href);
 }}
 </script>
 </body>
@@ -1342,11 +1837,12 @@ def _vm_tag_matches(vm, filter_parts):
 
 
 def filter_policies(ordered_categories, rules_by_policy, policy_map, groups_db,
-                    filter_text=None, filter_tag=None, vm_db=None):
+                    filter_text=None, filter_tag=None, filter_vm=None, vm_db=None):
     if vm_db is None:
         vm_db = {}
     ft = filter_text.lower() if filter_text else None
     tag_parts = [p.lower() for p in filter_tag.split(":")] if filter_tag else []
+    vm_names = [n.strip().lower() for n in filter_vm.split(",") if n.strip()] if filter_vm else []
     _effective_cache = {}
     def _get_effective(path):
         if path not in _effective_cache:
@@ -1414,21 +1910,40 @@ def filter_policies(ordered_categories, rules_by_policy, policy_map, groups_db,
             if eid in vm_db and _vm_tag_matches(vm_db[eid], parts):
                 return True
         return False
+    def group_matches_vm(path, names):
+        """Check if group contains VMs whose display_name matches any name in the list."""
+        if not path or path == "ANY" or path not in groups_db:
+            return False
+        g = groups_db[path]
+        # Check directly assigned VMs (ExternalIDExpression)
+        for m in g.get("members", []):
+            if m.get("type") == "external_id":
+                for eid in m.get("external_ids", []):
+                    if eid in vm_db and vm_db[eid].get("display_name", "").lower() in names:
+                        return True
+        # Check dynamically matching VMs (conditions)
+        effective = _get_effective(path)
+        for eid in effective:
+            if eid in vm_db and vm_db[eid].get("display_name", "").lower() in names:
+                return True
+        return False
     def group_path_matches(path):
         if not path or path == "ANY":
             return False
         text_ok = group_matches_text(path, ft) if ft else True
         tag_ok = group_matches_tag(path, tag_parts) if tag_parts else True
-        if ft and tag_parts:
-            return text_ok or tag_ok
-        return text_ok and tag_ok
+        vm_ok = group_matches_vm(path, vm_names) if vm_names else True
+        active = [x for x in [(ft, text_ok), (tag_parts, tag_ok), (vm_names, vm_ok)] if x[0]]
+        if not active:
+            return False
+        return any(ok for _, ok in active)
     for cat, policies in ordered_categories.items():
         matching = []
         for p in policies:
             path = p["path"]
             policy_rules = rules_by_policy.get(path, [])
             policy_name_hit = ft and ft in p.get("display_name", "").lower()
-            if policy_name_hit and not tag_parts:
+            if policy_name_hit and not tag_parts and not vm_names:
                 matching.append(p)
                 filtered_rules[path] = policy_rules
                 filtered_pmap[path] = p
@@ -1454,6 +1969,14 @@ def filter_policies(ordered_categories, rules_by_policy, policy_map, groups_db,
                                 break
                         if hit:
                             break
+                if not hit and policy_name_hit and vm_names:
+                    for field in ("source_groups", "destination_groups", "scope"):
+                        for gpath in r.get(field, []):
+                            if group_matches_vm(gpath, vm_names):
+                                hit = True
+                                break
+                        if hit:
+                            break
                 if hit:
                     matched_rules.append(r)
             if matched_rules:
@@ -1469,6 +1992,8 @@ def filter_policies(ordered_categories, rules_by_policy, policy_map, groups_db,
         parts_desc.append(f"text=\'{filter_text}\'")
     if filter_tag:
         parts_desc.append(f"tag=\'{filter_tag}\'")
+    if filter_vm:
+        parts_desc.append(f"vm=\'{filter_vm}\'")
     print(f"  Filter {', '.join(parts_desc)}: {tp} policies, {tr} rules matched")
     return filtered_ordered, filtered_rules, filtered_pmap
 
@@ -1477,17 +2002,20 @@ def print_usage():
     print("""NSX DFW Documentation Generator
 
 Usage:
-  nsx_dfw_doc.py fetch [output.json] [output.html] [--filter TEXT] [--filter-tag TAG]
+  nsx_dfw_doc.py fetch [output.json] [output.html] [--filter TEXT] [--filter-tag TAG] [--filter-vm VM,...]
       Fetch DFW objects + VM inventory and generate HTML.
 
-  nsx_dfw_doc.py <input.json> [output.html] [--filter TEXT] [--filter-tag TAG]
+  nsx_dfw_doc.py <input.json> [output.html] [--filter TEXT] [--filter-tag TAG] [--filter-vm VM,...]
       Generate HTML from previously fetched JSON.
 
   --filter TEXT        Match policy names, group names, condition values,
                        effective VM names (STARTSWITH/ENDSWITH/etc.), rule tags.
   --filter-tag TAG     Match NSX tag scope/value (colon = AND logic):
                          --filter-tag Z00:Prod
-  Both filters can be combined. Case-insensitive.
+  --filter-vm VM,...   Comma-separated VM display names. Only rules whose
+                       groups contain these VMs are included.
+                       Case-insensitive exact match on VM display_name.
+  All filters can be combined. Case-insensitive.
 
 Examples:
   nsx_dfw_doc.py fetch
@@ -1495,6 +2023,7 @@ Examples:
   nsx_dfw_doc.py dfw_objects.json --filter Z00
   nsx_dfw_doc.py dfw_objects.json --filter-tag Z00
   nsx_dfw_doc.py dfw_objects.json --filter-tag Z00:Prod
+  nsx_dfw_doc.py dfw_objects.json --filter-vm srv01.example.cz,srv02.example.cz
   nsx_dfw_doc.py dfw_objects.json --filter xdc --filter-tag Z00
   nsx_dfw_doc.py fetch --filter WSA04""")
 
@@ -1506,9 +2035,10 @@ def main():
 
     args = sys.argv[1:]
 
-    # Extract --filter and --filter-tag arguments
+    # Extract --filter, --filter-tag, and --filter-vm arguments
     filter_text = None
     filter_tag = None
+    filter_vm = None
     clean_args = []
     i = 0
     while i < len(args):
@@ -1517,6 +2047,9 @@ def main():
             i += 2
         elif args[i] == "--filter-tag" and i + 1 < len(args):
             filter_tag = args[i + 1]
+            i += 2
+        elif args[i] == "--filter-vm" and i + 1 < len(args):
+            filter_vm = args[i + 1]
             i += 2
         else:
             clean_args.append(args[i])
@@ -1554,6 +2087,11 @@ def main():
             suffix_parts.append(filter_text)
         if filter_tag:
             suffix_parts.append("tag-" + filter_tag.replace(":", "-"))
+        if filter_vm:
+            # Use first VM name (sanitized) to keep filename reasonable
+            first_vm = filter_vm.split(",")[0].strip().replace(".", "-")
+            vm_count = len([n for n in filter_vm.split(",") if n.strip()])
+            suffix_parts.append("vm-" + first_vm + (f"+{vm_count-1}" if vm_count > 1 else ""))
         if suffix_parts:
             html_output = base + "_" + "_".join(suffix_parts) + "_documentation.html"
         else:
@@ -1561,20 +2099,23 @@ def main():
 
     ordered, rules_by_policy, policy_map, groups_db, services_db, profiles_db, vm_db = parse_json(json_file)
 
-    if filter_text or filter_tag:
+    if filter_text or filter_tag or filter_vm:
         ordered, rules_by_policy, policy_map = filter_policies(
             ordered, rules_by_policy, policy_map, groups_db,
-            filter_text=filter_text, filter_tag=filter_tag, vm_db=vm_db)
+            filter_text=filter_text, filter_tag=filter_tag, filter_vm=filter_vm, vm_db=vm_db)
 
     filter_label = None
-    if filter_text and filter_tag:
-        filter_label = f"{filter_text} + tag:{filter_tag}"
-    elif filter_text:
-        filter_label = filter_text
-    elif filter_tag:
-        filter_label = f"tag:{filter_tag}"
+    label_parts = []
+    if filter_text:
+        label_parts.append(filter_text)
+    if filter_tag:
+        label_parts.append(f"tag:{filter_tag}")
+    if filter_vm:
+        label_parts.append(f"vm:{filter_vm}")
+    if label_parts:
+        filter_label = " + ".join(label_parts)
 
-    generate_html(ordered, rules_by_policy, policy_map, html_output, groups_db, services_db, profiles_db, vm_db=vm_db, filter_text=filter_label, filter_tag=filter_tag)
+    generate_html(ordered, rules_by_policy, policy_map, html_output, groups_db, services_db, profiles_db, vm_db=vm_db, filter_text=filter_label, filter_tag=filter_tag, filter_vm=filter_vm)
 
 
 if __name__ == "__main__":
