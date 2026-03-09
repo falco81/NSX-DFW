@@ -16,7 +16,7 @@ This toolkit solves that with three scripts:
 |---|---|
 | `nsxt_fw_analyzer.py` | Main analyzer — extract, deduplicate, filter, and report DFW flows |
 | `dns_cache_update.py` | Helper — bulk DNS PTR cache management, pre-population, and maintenance |
-| `nsx_dfw_doc.py` | DFW documentation — fetch policies/rules/groups from NSX API and generate interactive HTML reference |
+| `nsx_dfw_doc.py` | DFW documentation — fetch policies/rules/groups from NSX API and generate interactive HTML reference with Excel export |
 
 ## Features
 
@@ -25,7 +25,7 @@ This toolkit solves that with three scripts:
 - **Load Balancer detection** — identifies NSX LB traffic via 100.64.0.0/10 SNAT addresses, with dedicated badge, stats card, and one-click toggle filter
 - **GeoIP country flags** — offline SVG flag icons next to public IPs using the free DB-IP Lite database; interactive stats card lets you click any flag to filter by country
 - **Flexible exclusions** — exclude specific IPs/ports via CLI flags or file lists
-- **DNS PTR resolution** — reverse DNS against up to 2 custom DNS servers with persistent file cache and automatic retry of failed lookups
+- **DNS PTR resolution** — reverse DNS against up to 3 custom DNS servers with persistent file cache and automatic retry of failed lookups
 - **Port-to-service translation** — maps port numbers to service names (built-in ~270 ports or optional full IANA database with ~6,000 entries)
 - **Protocol descriptions** — human-readable labels for non-TCP/UDP protocols (ICMP, GRE, OSPF, etc.)
 - **Interactive HTML report** — self-contained, offline-capable dark-themed dashboard with sorting, filtering, drag-and-drop column management, and clickable Top Talkers
@@ -135,6 +135,7 @@ python3 nsxt_fw_analyzer.py INPUT [OPTIONS]
 | `--resolve-dns` | Enable PTR lookups (results cached to `.dns_ptr_cache.json`) |
 | `--dns-server IP` | Primary DNS server for PTR queries |
 | `--dns-server2 IP` | Secondary DNS server (fallback if primary fails) |
+| `--dns-server3 IP` | Tertiary DNS server (fallback if both above fail) |
 | `--dns-cache-file PATH` | Custom cache file path |
 
 ### Database Download
@@ -192,7 +193,7 @@ Example `skip_ips.txt`:
 ```bash
 # With custom DNS servers
 python3 nsxt_fw_analyzer.py logs_export.tar.gz --resolve-dns \
-    --dns-server 10.100.0.53 --dns-server2 10.100.1.53
+    --dns-server 10.100.0.53 --dns-server2 10.100.1.53 --dns-server3 10.100.2.53
 
 # Reuses cached results from previous runs automatically
 python3 nsxt_fw_analyzer.py logs_export.tar.gz --resolve-dns
@@ -214,7 +215,7 @@ python3 nsxt_fw_analyzer.py logs_export.tar.gz \
 ```bash
 python3 nsxt_fw_analyzer.py logs_export.tar.gz \
     -m all --resolve-dns \
-    --dns-server 10.100.0.53 --dns-server2 10.100.1.53 \
+    --dns-server 10.100.0.53 --dns-server2 10.100.1.53 --dns-server3 10.100.2.53 \
     --exclude-ips-file skip_ips.txt --exclude-ports 53,67,68 \
     --action PASS --direction IN --sort-by dst_ip --stats \
     -o full_analysis.csv
@@ -244,7 +245,7 @@ python3 nsxt_fw_analyzer.py --download-all
 │ Format:   HTML
 │ Mode:     all
 │ DNS:      True
-│ DNS srv:  10.100.0.53, 10.100.1.53
+│ DNS srv:  10.100.0.53, 10.100.1.53, 10.100.2.53
 │ Sort:     src_ip
 └──────────────────────────────────────────────┘
 
@@ -263,7 +264,7 @@ python3 nsxt_fw_analyzer.py --download-all
 ─────────────────────────────────────────────
 
 [3/4] DNS PTR resolution...
-[DNS] dnspython -> 10.100.0.53, 10.100.1.53
+[DNS] dnspython -> 10.100.0.53, 10.100.1.53, 10.100.2.53
   Resolving 142 unique IPs...  [142/142]
 
 [4/4] Writing output...
@@ -417,6 +418,7 @@ python3 dns_cache_update.py [OPTIONS]
 |---|---|---|
 | `--dns-server IP` | Primary DNS server | Configured in script |
 | `--dns-server2 IP` | Secondary DNS server (fallback) | Configured in script |
+| `--dns-server3 IP` | Tertiary DNS server (fallback) | Configured in script |
 | `--timeout SECONDS` | DNS query timeout per server | `2` |
 | `--cache-file PATH` | Path to cache file | `.dns_ptr_cache.json` |
 
@@ -439,8 +441,8 @@ python3 dns_cache_update.py [OPTIONS]
 
 ```
 [LOAD] 450 entries (312 resolved, 138 empty) from .dns_ptr_cache.json
-[DNS] Servers: 10.100.0.53, 10.100.1.53
-[RETRY] Resolving 138 IPs against 10.100.0.53, 10.100.1.53...
+[DNS] Servers: 10.100.0.53, 10.100.1.53, 10.100.2.53
+[RETRY] Resolving 138 IPs against 10.100.0.53, 10.100.1.53, 10.100.2.53...
   + 10.100.1.15        -> app-server01.example.com  [10.100.0.53]
   + 10.100.2.30        -> db-replica.internal        [10.100.1.53]
   ...
@@ -515,44 +517,49 @@ python3 dns_cache_update.py --remove-empty
 
 # nsx_dfw_doc.py
 
-Interactive HTML documentation generator for NSX-T Distributed Firewall configuration. Connects to the NSX Manager Policy API to fetch all security policies, rules, groups, services, context profiles, and VM inventory, then renders a self-contained dark-themed HTML reference with sidebar navigation, enriched object details, and cross-linking between rules and inventory.
+Interactive HTML documentation generator for NSX-T Distributed Firewall configuration. Connects to the NSX Manager Policy API to fetch all security policies, rules, groups, services (including system-owned), context profiles, VM inventory with guest OS, and virtual interfaces with IP addresses, then renders a self-contained dark-themed HTML reference with sidebar navigation, enriched object details, Excel export, and cross-linking between rules and inventory.
 
 Can also work fully offline from a previously exported JSON file.
 
 > **Requires:** `pip install requests` (only for `fetch` mode — offline JSON mode has no dependencies)
+>
+> **Optional:** `pip install openpyxl` (enables the Excel export button in HTML reports)
 
 ## How It Works
 
 The script operates in two stages:
 
-1. **Fetch** — connects to NSX Manager via the Policy API (`/policy/api/v1/infra`) and exports DFW domains, security policies, rules, groups, user-defined services, context profiles, and full VM inventory (with tags and power state) into a single JSON file. System-owned objects (built-in NSX services) are excluded from the export but their display names are preserved when referenced by nested service entries.
+1. **Fetch** — connects to NSX Manager via the Policy API and Management API, exports DFW domains, security policies, rules, groups, all services (user-defined and system-owned for port resolution), context profiles, full VM inventory (with tags, power state, and guest OS), and virtual interface IP addresses into a single JSON file.
 
-2. **Generate** — parses the JSON and produces a fully self-contained HTML document. All CSS, JavaScript, and data are embedded — no external dependencies, works offline in any browser.
+2. **Generate** — parses the JSON and produces a fully self-contained HTML document with an embedded Excel export. All CSS, JavaScript, and data are embedded — no external dependencies, works offline in any browser.
 
 ## Features
 
 - **Live fetch or offline JSON** — pull directly from NSX Manager or generate from a previously saved JSON export
-- **VM inventory** — full virtual machine database with display names, power state, NSX tags, and group membership; VMs with matching tags are resolved into groups via dynamic condition evaluation
+- **VM inventory with IP and OS** — full virtual machine database with display names, IP addresses (from VIFs), guest OS, power state, NSX tags, and group membership; VMs with matching tags are resolved into groups via dynamic condition evaluation
+- **Complete service port resolution** — all services display protocol/port details, including NSX system-owned services (HTTPS, SSH, RDP, LDAP, Kerberos, etc.); nested services like Microsoft Active Directory V2 are fully expanded with each sub-service showing its ports; a built-in dictionary of ~40 common NSX services provides fallback resolution for older JSON exports that lack system service data
+- **Service type distinction** — custom (user-defined) services displayed in purple with clickable links to inventory; NSX default (system-owned) services displayed in gray with an `NSX` badge, visually distinguishing the two types
+- **Excel export** — the HTML report includes an Export Excel button that downloads a fully formatted `.xlsx` file with color-coded rules, policy separator rows, and popup comments on Source/Destination/Services cells containing detailed IP addresses, VM names, and service breakdowns with `[Custom]`/`[NSX]` badges; requires `openpyxl` (the button is disabled with instructions if not installed)
 - **Category-based layout** — policies grouped by DFW processing order (Ethernet → Emergency → Infrastructure → Environment → Application), sorted by `internal_sequence_number` from the API
 - **Sidebar navigation** — auto-width sidebar listing all policies per category with rule counts; click to jump directly to any policy
 - **Full-text search** — search box filters policies, rules, groups, and services across the entire document
 - **Toggle filters** — one-click buttons to hide auto-generated (system-owned) policies and disabled rules
-- **Enriched groups** — rules display group members inline: IP addresses, tag conditions, VM names (resolved from ExternalIDExpression with clickable links to VM inventory), nested expressions with full condition trees, and clickable cross-references to other groups
-- **Enriched services** — nested service entries (e.g. Microsoft Active Directory V2) are resolved to their constituent service names instead of showing raw `NestedServiceServiceEntry` types
-- **Clickable cross-links** — group names in rules link to the Groups inventory; service names link to the Services inventory; VM names link to the VM inventory
+- **Enriched groups** — rules display complete group members inline: all IP addresses, tag conditions, VM names with IP addresses (resolved from ExternalIDExpression with clickable links to VM inventory), nested expressions with full condition trees, and clickable cross-references to other groups — no data is truncated
+- **Enriched services** — nested service entries (e.g. Microsoft Active Directory V2 with 16 sub-services) are resolved to their constituent service names with protocol/port details; pipe separator (`|`) prevents ambiguity with service names containing commas
+- **Clickable cross-links** — group names in rules link to the Groups inventory; custom service names link to the Services inventory; VM names link to the VM inventory
 - **Log Prefix column** — each rule row displays the NSX log label (tag/comment) alongside logging on/off status, providing full visibility into log identification
 - **Rule metadata** — displays rule tags / log labels, logging status, enabled/disabled state, direction, IP protocol, and scope
-- **Groups inventory** — full table of all groups with member types, member details, and rule reference counts; unused groups visually dimmed
+- **Groups inventory** — full table of all groups with member types, complete member details, and rule reference counts; unused groups visually dimmed
 - **Services inventory** — all user-defined services with protocol/port details and rule reference counts
-- **VM inventory** — full table of all virtual machines with power state, NSX tags, and group membership
-- **`--filter` / `--filter-tag` options** — generate documentation for a specific project or segment; when active, inventory sections (Groups, Services, VMs) are automatically filtered to show only objects referenced by matching rules, with nested dependencies fully resolved
+- **VM inventory** — full table of all virtual machines with IP address, guest OS, power state, NSX tags, and group membership
+- **`--filter` / `--filter-tag` / `--filter-vm` options** — generate documentation for a specific project, segment, or set of VMs; when active, inventory sections (Groups, Services, VMs) are automatically filtered to show only objects referenced by matching rules, with nested dependencies fully resolved
 - **Fully dynamic** — no hardcoded NSX object names, category names, prefixes, or detection strings; works with any NSX-T environment
 
 ## CLI Reference
 
 ```
-nsx_dfw_doc.py fetch [output.json] [output.html] [--filter TEXT] [--filter-tag TAG]
-nsx_dfw_doc.py <input.json> [output.html] [--filter TEXT] [--filter-tag TAG]
+nsx_dfw_doc.py fetch [output.json] [output.html] [--filter TEXT] [--filter-tag TAG] [--filter-vm VM,...]
+nsx_dfw_doc.py <input.json> [output.html] [--filter TEXT] [--filter-tag TAG] [--filter-vm VM,...]
 ```
 
 ### Modes
@@ -568,8 +575,9 @@ nsx_dfw_doc.py <input.json> [output.html] [--filter TEXT] [--filter-tag TAG]
 |---|---|
 | `--filter TEXT` | Match policy names, group names, condition values, effective VM names, and rule tags. Case-insensitive substring match. |
 | `--filter-tag TAG` | Match NSX tag scope/value on VMs and groups. Use colon for AND logic: `--filter-tag zone01:prod` matches VMs/groups whose tags contain both `zone01` and `prod`. |
+| `--filter-vm VM,...` | Comma-separated VM display names. Only rules whose source/destination/scope groups contain these VMs (directly or via dynamic conditions) are included. Case-insensitive exact match on VM `display_name`. |
 
-Both `--filter` and `--filter-tag` can be combined. When combined, a rule matches if it hits either filter (OR logic between the two filters).
+All three filters can be combined. When combined, a rule matches if it hits any of the active filters (OR logic between filters).
 
 ### Output Files
 
@@ -577,7 +585,7 @@ Both `--filter` and `--filter-tag` can be combined. When combined, a rule matche
 |---|---|---|
 | JSON export | `fetch` mode | `dfw_objects.json` |
 | HTML report | Always | `<json_basename>_documentation.html` |
-| Filtered report | `--filter` / `--filter-tag` used | `<json_basename>_<filter>_documentation.html` |
+| Filtered report | `--filter` / `--filter-tag` / `--filter-vm` used | `<json_basename>_<filter>_documentation.html` |
 
 Filenames can be overridden by passing `.json` and/or `.html` paths as positional arguments.
 
@@ -625,6 +633,22 @@ python3 nsx_dfw_doc.py dfw_objects.json --filter-tag zone01:prod
 python3 nsx_dfw_doc.py dfw_objects.json --filter acme --filter-tag zone01
 ```
 
+### VM-Based Filtering
+
+```bash
+# Filter by VM name — show only rules whose groups contain this VM
+python3 nsx_dfw_doc.py dfw_objects.json --filter-vm srv-web01.example.com
+
+# Multiple VMs (comma-separated)
+python3 nsx_dfw_doc.py dfw_objects.json --filter-vm srv-web01.example.com,srv-db01.example.com
+
+# Combined with tag filter — rules match if they hit either filter
+python3 nsx_dfw_doc.py dfw_objects.json --filter-tag zone01 --filter-vm srv-web01.example.com
+
+# All three filters combined
+python3 nsx_dfw_doc.py dfw_objects.json --filter acme --filter-tag zone01 --filter-vm srv-web01.example.com
+```
+
 ### Filter Logic
 
 #### `--filter TEXT`
@@ -648,17 +672,30 @@ Matches against NSX tags on VMs and group tag conditions. Supports AND logic wit
 | Group's effective VMs have matching NSX tags (scope or value) | Rule is included |
 | VMs directly assigned to group (ExternalID) have matching tags | Rule is included |
 
+#### `--filter-vm VM,...`
+
+Case-insensitive exact match on VM `display_name`. A rule is included if any of its source/destination/scope groups contain one of the specified VMs.
+
+| Condition | Behavior |
+|---|---|
+| Group has the VM directly assigned (ExternalIDExpression) | Rule is included |
+| Group's dynamic conditions (Name ENDSWITH, Tag EQUALS, etc.) evaluate to include the VM | Rule is included |
+
+This means that both statically and dynamically assigned VMs are found. If a group uses a condition like `VirtualMachine Name ENDSWITH .example.com` and the specified VM matches that condition, the rule is included.
+
+When combined with other filters, a rule matches if it hits **any** of the active filters (OR logic between filters).
+
 This means infrastructure policies that reference project-specific groups are automatically included with the relevant rules, even if the policy name itself does not match.
 
 ### Filtered Inventory Sections
 
-When any filter is active (`--filter` and/or `--filter-tag`), the inventory sections at the bottom of the HTML report are automatically scoped to show only objects referenced by the matching rules:
+When any filter is active (`--filter`, `--filter-tag`, and/or `--filter-vm`), the inventory sections at the bottom of the HTML report are automatically scoped to show only objects referenced by the matching rules:
 
 | Section | Unfiltered | Filtered |
 |---|---|---|
 | **Groups** | All groups in the `default` domain | Only groups referenced by filtered rules (source, destination, scope), plus nested group dependencies resolved via PathExpression |
 | **Services** | All user-defined services | Only services referenced by filtered rules, plus nested service dependencies resolved via NestedServiceServiceEntry |
-| **VMs** | All VMs in inventory | Only VMs that are members of referenced groups (ExternalID) or match group conditions (dynamic evaluation). When `--filter-tag` is active, VMs are further restricted to only those whose NSX tags match the tag filter. |
+| **VMs** | All VMs in inventory | Only VMs that are members of referenced groups (ExternalID) or match group conditions (dynamic evaluation). When `--filter-tag` is active, VMs are further restricted to only those whose NSX tags match the tag filter. When `--filter-vm` is active, VMs are further restricted to only those whose display names match the specified list. |
 
 Nested dependency resolution ensures that no referenced objects are accidentally omitted. For example, if a filtered rule references a group that includes other groups via PathExpression, all transitively referenced groups are included. Similarly, if a service bundles sub-services via NestedServiceServiceEntry, those are included as well.
 
@@ -670,8 +707,8 @@ The header of each inventory section shows the filtered count alongside the tota
 
 ```
 Loading JSON: dfw_objects.json
-  Found 60 policies, 316 rules
-  2862 groups, 110 services, 2 profiles, 1473 VMs
+  Found 60 policies, 319 rules
+  2938 groups, 526 services, 2 profiles, 1572 VMs
   Categories: Ethernet, Emergency, Infrastructure, Environment, Application
 HTML documentation written to: dfw_objects_documentation.html
 ```
@@ -680,8 +717,8 @@ With `--filter`:
 
 ```
 Loading JSON: dfw_objects.json
-  Found 60 policies, 316 rules
-  2862 groups, 110 services, 2 profiles, 1473 VMs
+  Found 60 policies, 319 rules
+  2938 groups, 526 services, 2 profiles, 1572 VMs
   Categories: Ethernet, Emergency, Infrastructure, Environment, Application
   Filter text='proj-alpha': 3 policies, 27 rules matched
 HTML documentation written to: dfw_objects_proj-alpha_documentation.html
@@ -691,11 +728,22 @@ With `--filter-tag`:
 
 ```
 Loading JSON: dfw_objects.json
-  Found 60 policies, 316 rules
-  2862 groups, 110 services, 2 profiles, 1473 VMs
+  Found 60 policies, 319 rules
+  2938 groups, 526 services, 2 profiles, 1572 VMs
   Categories: Ethernet, Emergency, Infrastructure, Environment, Application
-  Filter tag='zone01': 10 policies, 35 rules matched
-HTML documentation written to: dfw_objects_tag-zone01_documentation.html
+  Filter tag='zone01:prod': 10 policies, 35 rules matched
+HTML documentation written to: dfw_objects_tag-zone01-prod_documentation.html
+```
+
+With `--filter-vm`:
+
+```
+Loading JSON: dfw_objects.json
+  Found 60 policies, 319 rules
+  2938 groups, 526 services, 2 profiles, 1572 VMs
+  Categories: Ethernet, Emergency, Infrastructure, Environment, Application
+  Filter vm='srv-web01.example.com,srv-db01.example.com': 9 policies, 34 rules matched
+HTML documentation written to: dfw_objects_vm-srv-web01-example-com+1_documentation.html
 ```
 
 ### HTML Report Structure
@@ -706,12 +754,12 @@ The generated HTML document contains these sections:
 |---|---|
 | **Sidebar** | Category headers with color indicators, policy names with rule counts, inventory links with object counts, click-to-navigate |
 | **Header** | Title, filter indicator (if active), global stats (policies, rules, allow/drop/reject/disabled counts, groups, services, VMs) |
-| **Filter bar** | Full-text search, toggle buttons for auto-generated policies and disabled rules |
+| **Filter bar** | Full-text search, toggle buttons for auto-generated policies and disabled rules, Export Excel button |
 | **Policies** | One card per policy: metadata row (badges for Stateful/TCP Strict/Locked/Default/Kubernetes, created by, dates, scope), then a rules table |
 | **Rules table** | Columns: Seq, Name, Action, Source, Destination, Services, Direction, Flags, Log Prefix |
-| **Groups inventory** | All groups (or filtered subset) with display name, member types, member details, rule reference count; filter input and Hide Unused toggle |
-| **Services inventory** | All services (or filtered subset) with protocol/port details and rule reference count; filter input |
-| **VM inventory** | All VMs (or filtered subset) with display name, power state, NSX tags, group membership; filter input |
+| **Groups inventory** | All groups (or filtered subset) with display name, member types, complete member details, rule reference count; filter input and Hide Unused toggle |
+| **Services inventory** | All user-defined services (or filtered subset) with protocol/port details and rule reference count; filter input |
+| **VM inventory** | All VMs (or filtered subset) with display name, IP address, guest OS, power state, NSX tags, group membership; filter input |
 
 ### Rule Display Details
 
@@ -719,8 +767,8 @@ Each rule row shows:
 
 | Element | Description |
 |---|---|
-| **Source / Destination** | Group display names with clickable links to inventory; inline member detail (IPs, tag conditions, VM names with links to VM inventory, nested expressions) |
-| **Services** | Service names with clickable links; protocol/port shown inline; nested services resolved to constituent names |
+| **Source / Destination** | Group display names with clickable links to inventory; inline member detail with complete IP addresses, tag conditions, VM names with IP addresses and links to VM inventory, nested expressions — all data shown without truncation |
+| **Services** | Service names with protocol/port details; custom services in purple with clickable inventory links; NSX system services in gray with `NSX` badge; pipe separator for clarity; nested services fully expanded with each sub-service showing `[Name](protocol/port)` |
 | **Action badge** | Color-coded: green (ALLOW), red (DROP), orange (REJECT) |
 | **Flags** | Logging on/off badge, enabled/disabled state, IP protocol override badge |
 | **Log Prefix** | The NSX log label (tag/comment) configured on the rule — displayed in a dedicated column for easy identification of log entries |
@@ -731,17 +779,59 @@ Groups are rendered with full member detail depending on expression type:
 
 | Expression Type | Display |
 |---|---|
-| IPAddressExpression | Comma-separated IP addresses (first 5 shown, remainder as +N count) |
+| IPAddressExpression | All IP addresses comma-separated |
 | Condition | `MemberType Key OPERATOR value` (e.g. `VirtualMachine Tag EQUALS web-tier`) |
 | NestedExpression | Recursive condition tree with AND/OR operators in brackets |
-| PathExpression (groups) | Clickable links to referenced groups (first 4 shown) |
+| PathExpression (groups) | Clickable links to all referenced groups |
 | PathExpression (segments) | Segment path names |
-| ExternalIDExpression | VM display names with clickable links to VM inventory (first 5 shown, remainder as +N count) |
+| ExternalIDExpression | All VM display names with IP addresses and clickable links to VM inventory |
 | ConjunctionOperator | `AND` / `OR` between conditions |
 
-### Nested Service Resolution
+### Service Port Resolution
 
-Services of type `NestedServiceServiceEntry` (e.g. Microsoft Active Directory V2, which bundles 16 sub-services) are resolved to their constituent service display names. If the referenced service exists in the export, its protocol/port details are shown in parentheses. Otherwise, the service display name is shown as-is.
+All services display their underlying protocol/port details, regardless of whether they are user-defined or NSX system-owned. Port resolution works through three layers:
+
+| Priority | Source | Description |
+|---|---|---|
+| 1 | System services from JSON export | Fetched from NSX API when using the latest `fetch` command (415+ NSX built-in services) |
+| 2 | Built-in dictionary (~40 services) | Fallback for older JSON exports without system service data; covers HTTP, HTTPS, SSH, RDP, DNS, SMTP, NTP, LDAP, Kerberos, MSSQL, MySQL, ICMP, AD sub-services, and more |
+| 3 | Service name as-is | If no port definition is found, the service name is displayed without port detail |
+
+Services of type `NestedServiceServiceEntry` (e.g. Microsoft Active Directory V2, which bundles 16 sub-services) are fully expanded with each sub-service showing its resolved port. The pipe separator (`|`) and bracket notation `[ServiceName](port)` prevent ambiguity with service names that contain commas.
+
+Example — Microsoft Active Directory V2 fully resolved:
+
+```
+[MS_RPC_TCP](ALG:MS_RPC_TCP) | [NTP Time Server](UDP/123) | [DNS-UDP](UDP/53) |
+[MS-DS-TCP](TCP/445) | [LDAP Global Catalog](TCP/3268) | [LDAP-over-SSL](TCP/636) |
+[SOAP](TCP/9389) | [Active Directory Server](TCP/464) | [DNS-TCP](TCP/53) |
+[LDAP-UDP](UDP/389) | [Active Directory Server UDP](UDP/464) |
+[KERBEROS-TCP](TCP/88) | [KERBEROS-UDP](UDP/88) |
+[Windows-Global-Catalog-over-SSL](TCP/3269) |
+[Win 2008 - RPC, DCOM, EPM, DRSUAPI, NetLogonR, SamR, FRS](TCP/49152-65535) |
+[LDAP](TCP/389)
+```
+
+### Excel Export
+
+The HTML report includes an **Export Excel** button that generates and downloads a fully formatted `.xlsx` file directly in the browser. The Excel file contains:
+
+| Feature | Description |
+|---|---|
+| **Columns** | Category, Policy, Seq, Rule Name, Action, Source, Destination, Services, Dir, Log, Disabled, Log Prefix |
+| **Policy separator rows** | Bold blue text rows visually separating each policy section |
+| **Color coding** | ALLOW rules in green, DROP in red, REJECT in orange, disabled in gray italic |
+| **Frozen header** | First row frozen for scrolling; auto-filter enabled on all columns |
+| **Source/Destination comments** | Hover popup on each cell showing group name with full IP addresses, VM names with IPs, or dynamic conditions |
+| **Services comments** | Hover popup showing `[Custom]` or `[NSX]` badge with service name and port details for each service |
+
+The XLSX is generated server-side by `openpyxl` during HTML generation and embedded as base64 in the HTML. The button decodes and downloads it — no runtime dependencies, fully offline.
+
+If `openpyxl` is not installed, the button is disabled with a tooltip:
+
+```bash
+pip install openpyxl
+```
 
 ## Configuration
 
@@ -757,14 +847,15 @@ The `fetch` command prompts interactively for hostname, username, and password. 
 
 ## API Endpoints
 
-The script fetches from four NSX API endpoints:
+The script fetches from five NSX API endpoints:
 
 | Endpoint | Objects |
 |---|---|
-| `/policy/api/v1/infra?filter=Type-Service` | User-defined services (system-owned excluded) |
+| `/policy/api/v1/infra?filter=Type-Service` | All services — user-defined and system-owned (for port resolution) |
 | `/policy/api/v1/infra?filter=Type-PolicyContextProfile` | User-defined context profiles |
 | `/policy/api/v1/infra?filter=Type-Domain\|Group\|SecurityPolicy\|Rule` | Domains, groups, security policies, rules |
-| `/api/v1/fabric/virtual-machines?page_size=500` | Full VM inventory with tags and power state (paginated) |
+| `/api/v1/fabric/virtual-machines?page_size=500` | Full VM inventory with tags, power state, and guest OS (paginated) |
+| `/api/v1/fabric/vifs?page_size=500` | Virtual interfaces with IP addresses per VM (paginated) |
 
 All responses are merged into a single JSON file. TLS certificate verification is disabled (`verify=False`) to support self-signed certificates common in lab and production NSX deployments.
 
@@ -772,7 +863,8 @@ All responses are merged into a single JSON file. TLS certificate verification i
 
 - Python 3.8+
 - `requests` for fetch mode (`pip install requests`)
-- No dependencies for offline JSON-to-HTML generation
+- `openpyxl` for Excel export in HTML reports (`pip install openpyxl`) — optional, HTML generation works without it
+- No other dependencies for offline JSON-to-HTML generation
 
 ---
 
@@ -782,14 +874,17 @@ Both `nsxt_fw_analyzer.py` and `dns_cache_update.py` share the same resolution f
 
 ```
 1. Query PRIMARY DNS server
-   ├── PTR found → use hostname, DONE (skip secondary)
+   ├── PTR found → use hostname, DONE (skip remaining)
    └── NXDOMAIN / timeout → continue
 2. Query SECONDARY DNS server
+   ├── PTR found → use hostname, DONE (skip remaining)
+   └── NXDOMAIN / timeout → continue
+3. Query TERTIARY DNS server
    ├── PTR found → use hostname, DONE
    └── NXDOMAIN / timeout → store ""
 ```
 
-This ensures both servers are always consulted when needed — important when different DNS servers are authoritative for different reverse zones.
+This ensures all three servers are always consulted when needed — important when different DNS servers are authoritative for different reverse zones.
 
 ### Cache File
 
@@ -817,6 +912,7 @@ Default DNS servers and timeouts are configured at the top of each script. Edit 
 # In nsxt_fw_analyzer.py and dns_cache_update.py:
 DNS_SERVER   = "10.100.0.53"   # Primary DNS for PTR lookups
 DNS_SERVER2  = "10.100.1.53"   # Secondary DNS for PTR lookups
+DNS_SERVER3  = "10.100.2.53"   # Tertiary DNS for PTR lookups
 DNS_TIMEOUT  = 2               # Seconds per query per server
 ```
 
@@ -842,12 +938,15 @@ DNS_TIMEOUT  = 2               # Seconds per query per server
 | Flags show as 2-letter codes, not images | Country not in built-in SVG set (~70 countries); this is expected for rare countries |
 | `--dns-server` has no effect | Install `dnspython` — without it, system resolver is used |
 | `dnspython` package not found in dnf | Package name is `python3-dns` on RHEL/Fedora |
+| Export Excel button disabled in HTML report | Install `openpyxl`: `pip install openpyxl`, then regenerate the HTML |
+| NSX system services show name without ports | Regenerate HTML from JSON exported with latest `fetch` (includes system services); or the built-in dictionary covers the most common ones automatically |
 
 ## Requirements
 
 - Python 3.8+
 - No external dependencies for core functionality (CSV output, HTML report, port translation)
 - `dnspython` for custom DNS server support (`pip install dnspython` or `dnf install python3-dns`)
+- `openpyxl` for Excel export in DFW documentation HTML reports (`pip install openpyxl`)
 
 ## License
 
