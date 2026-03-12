@@ -34,9 +34,9 @@ from pathlib import Path
 # CONFIGURATION
 # =============================================================================
 
-DNS_SERVER     = "1.1.1.1"   # Primary DNS for PTR lookups
-DNS_SERVER2    = "2.2.2.2"   # Secondary DNS for PTR lookups
-DNS_SERVER3    = "3.3.3.3"   # Tertiary DNS for PTR lookups
+DNS_SERVER     = "1.1.1.1"    # Primary DNS for PTR lookups
+DNS_SERVER2    = "2.2.2.2"    # Secondary DNS for PTR lookups
+DNS_SERVER3    = "3.3.3.3"    # Tertiary DNS for PTR lookups
 DNS_TIMEOUT    = 2
 DNS_CACHE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), ".dns_ptr_cache.json"
@@ -1686,7 +1686,7 @@ DESCRIPTION:
  REQUIRED ARGUMENT
 ================================================================================
 
-  input                 Path to tar.gz archive with CSV files from Log Insight.
+  input                 Path to tar.gz archive or CSV file from Log Insight.
 
 ================================================================================
  OPTIONAL ARGUMENTS
@@ -1938,7 +1938,7 @@ def main():
         description="NSX-T DFW Log Analyzer - extract, filter, deduplicate flows",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=USAGE_TEXT)
-    p.add_argument("input", help="tar.gz archive with CSV files")
+    p.add_argument("input", help="tar.gz archive or CSV file")
     p.add_argument("-o", "--output", help="Output CSV (default: auto)")
     p.add_argument("-m", "--mode", choices=["private", "public", "multicast", "all"],
                    default="private", help="IP filter mode (default: private)")
@@ -2020,11 +2020,17 @@ def main():
     # Load GeoIP database if available (optional, for HTML country flags)
     load_geoip()
     with tempfile.TemporaryDirectory(prefix="nsxt_") as tmp:
-        print("[1/4] Extracting CSVs...", file=sys.stderr)
-        csvs = extract_csvs(args.input, tmp)
-        print(f"  Found {len(csvs)} CSV files\n", file=sys.stderr)
+        inp = args.input
+        if inp.lower().endswith(".csv"):
+            print("[1/4] Reading CSV file directly...", file=sys.stderr)
+            csvs = [inp]
+            print(f"  Input: {os.path.basename(inp)}\n", file=sys.stderr)
+        else:
+            print("[1/4] Extracting CSVs...", file=sys.stderr)
+            csvs = extract_csvs(inp, tmp)
+            print(f"  Found {len(csvs)} CSV files\n", file=sys.stderr)
         if not csvs:
-            print("Error: No CSVs in archive!", file=sys.stderr); sys.exit(1)
+            print("Error: No CSVs found!", file=sys.stderr); sys.exit(1)
 
         print("[2/4] Processing & deduplicating...", file=sys.stderr)
         recs, ips = process(csvs, args.mode, ex_ips, ex_ports,
