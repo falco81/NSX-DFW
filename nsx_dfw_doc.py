@@ -199,12 +199,16 @@ def fetch_nsx_objects(nsx_host=None, username=None, password=None, output_file=N
     profiles_json = resp.json()
     print(f"    -> {len(profiles_json.get('children', []))} children received")
     user_defined_profiles = []
+    system_profiles = []
     for child in profiles_json.get("children", []):
         inner_key, inner_obj = _get_inner_object(child)
         if inner_obj is None:
             continue
         if inner_obj.get("_system_owned") == False:
             user_defined_profiles.append(child)
+        else:
+            system_profiles.append(child)
+    print(f"    -> {len(user_defined_profiles)} user-defined, {len(system_profiles)} system")
 
     print("  Fetching DFW configuration ...")
     resp = session.get(nsx_mgr + '/policy/api/v1/infra?filter=Type-Domain|Group|SecurityPolicy|Rule')
@@ -213,7 +217,7 @@ def fetch_nsx_objects(nsx_host=None, username=None, password=None, output_file=N
         sys.exit(1)
     dfw_json = resp.json()
     print(f"    -> {len(dfw_json.get('children', []))} children received")
-    dfw_json["children"] = dfw_json["children"] + user_defined_services + system_services + user_defined_profiles
+    dfw_json["children"] = dfw_json["children"] + user_defined_services + system_services + user_defined_profiles + system_profiles
 
     # Fetch VM inventory (paginated)
     print("  Fetching virtual machines inventory ...")
@@ -336,10 +340,19 @@ def parse_json(filepath):
                 _parse_service(obj, services)
             elif ctype == "PolicyContextProfile":
                 p_path = obj.get("path", "")
+                # Extract attributes (DOMAIN_NAME, URL_CATEGORY, etc.)
+                attrs = []
+                for attr in obj.get("attributes", []):
+                    key = attr.get("key", "")
+                    values = attr.get("value", [])
+                    if key and values:
+                        attrs.append({"key": key, "values": values})
                 profiles[p_path] = {
                     "id": obj.get("id", ""),
                     "display_name": obj.get("display_name", ""),
                     "path": p_path,
+                    "attributes": attrs,
+                    "_system_owned": bool(obj.get("_system_owned", False)),
                 }
             elif ctype == "Domain":
                 _parse_domain(obj, policies, rules_by_policy, groups)
@@ -413,6 +426,34 @@ def parse_json(filepath):
             _injected += 1
     if _injected:
         print(f"  Injected {_injected} built-in service definitions")
+
+    # Inject built-in profile definitions for referenced but missing profiles
+    _builtin_profiles = {
+        "DNS": {"display_name": "DNS", "attributes": [{"key": "DOMAIN_NAME", "values": ["(DNS Layer 7)"]}]},
+    }
+    _referenced_prof_paths = set()
+    for rlist in rules_by_policy.values():
+        for r in rlist:
+            for pp in r.get("profiles", []):
+                if pp != "ANY":
+                    _referenced_prof_paths.add(pp)
+    _prof_injected = 0
+    for pp in _referenced_prof_paths:
+        if pp in profiles:
+            continue
+        prof_id = pp.split("/")[-1] if "/" in pp else pp
+        if prof_id in _builtin_profiles:
+            bp = _builtin_profiles[prof_id]
+            profiles[pp] = {
+                "id": prof_id,
+                "display_name": bp["display_name"],
+                "path": pp,
+                "attributes": bp["attributes"],
+                "_system_owned": True,
+            }
+            _prof_injected += 1
+    if _prof_injected:
+        print(f"  Injected {_prof_injected} built-in profile definitions")
 
     # Resolve nested service references
     for svc in services.values():
@@ -802,6 +843,73 @@ def format_groups(group_paths, groups_db, vm_db=None):
     return " ".join(parts)
 
 
+def format_profiles(profile_paths, profiles_db):
+    """Format list of profile paths into HTML."""
+    if not profile_paths or profile_paths == ["ANY"]:
+        return '<span class="any-badge">ANY</span>'
+    parts = []
+    for path in profile_paths:
+        if path == "ANY":
+            parts.append('<span class="any-badge">ANY</span>')
+            continue
+        if path in profiles_db:
+            prof = profiles_db[path]
+            display = prof.get("display_name", path.split("/")[-1])
+            prof_id = prof.get("id", display)
+            is_sys = prof.get("_system_owned", False)
+            attrs = prof.get("attributes", [])
+            # Build detail: show domain list
+            detail_parts = []
+            for attr in attrs:
+                key = attr.get("key", "")
+                values = attr.get("values", [])
+                if key == "DOMAIN_NAME" and values:
+                    detail_parts.extend(values)
+                elif key and values:
+                    detail_parts.append(f'{key}: {", ".join(values[:5])}')
+            detail_html = ""
+            if detail_parts:
+                detail_html = '<span class="profile-detail">' + ", ".join(_esc(d) for d in detail_parts) + '</span>'
+            badge = '<span class="svc-badge-sys">NSX</span>' if is_sys else ""
+            link_cls = "profile-link profile-sys" if is_sys else "profile-link"
+            parts.append(
+                f'<span class="profile-enriched">'
+                f'<a href="#prof-{_esc(prof_id)}" class="{link_cls}">{_esc(display)}</a>{badge}'
+                f'{detail_html}'
+                f'</span>'
+            )
+        else:
+            seg = path.split("/")[-1] if "/" in path else path
+            parts.append(f'<span class="profile-link">{_esc(seg)}</span>')
+    return " ".join(parts)
+
+
+def _format_profiles_text(profile_paths, profiles_db):
+    """Format profiles into plain text for Excel."""
+    if not profile_paths or profile_paths == ["ANY"]:
+        return "ANY"
+    parts = []
+    for path in profile_paths:
+        if path == "ANY":
+            parts.append("ANY")
+            continue
+        if path in profiles_db:
+            prof = profiles_db[path]
+            display = prof.get("display_name", path.split("/")[-1])
+            attrs = prof.get("attributes", [])
+            domain_list = []
+            for attr in attrs:
+                if attr.get("key") == "DOMAIN_NAME":
+                    domain_list.extend(attr.get("values", []))
+            if domain_list:
+                parts.append(f'{display}: {", ".join(domain_list)}')
+            else:
+                parts.append(display)
+        else:
+            parts.append(path.split("/")[-1] if "/" in path else path)
+    return " | ".join(parts)
+
+
 def format_services(svc_paths, services_db):
     """Format list of service paths into HTML."""
     if not svc_paths or svc_paths == ["ANY"]:
@@ -896,6 +1004,7 @@ def _build_vm_section(vm_db, groups_db, is_filtered=False, total_vms=0):
     lines.append('  </div>')
     lines.append('  <div class="filter-bar">')
     lines.append('    <input type="text" id="vmSearchInput" placeholder="Filter VMs..." oninput="filterVMs()" />')
+    lines.append('    <span id="vmSearchInputCount" class="search-count"></span>')
     lines.append('  </div>')
     lines.append('  <div class="rules-table-wrap">')
     lines.append('  <table class="rules-table" id="vmTable">')
@@ -976,26 +1085,26 @@ def _build_xlsx_base64(excel_rows, title):
     default_font = Font(name='Calibri', size=10)
 
     # Column widths
-    col_widths = {'A': 16, 'B': 38, 'C': 6, 'D': 32, 'E': 9, 'F': 45, 'G': 45, 'H': 50, 'I': 8, 'J': 5, 'K': 9, 'L': 38}
+    col_widths = {'A': 16, 'B': 38, 'C': 6, 'D': 32, 'E': 9, 'F': 45, 'G': 45, 'H': 50, 'I': 35, 'J': 8, 'K': 5, 'L': 9, 'M': 38}
     for col, width in col_widths.items():
         ws.column_dimensions[col].width = width
 
     # Header
-    headers = ['Category', 'Policy', 'Seq', 'Rule Name', 'Action', 'Source', 'Destination', 'Services', 'Dir', 'Log', 'Disabled', 'Log Prefix']
+    headers = ['Category', 'Policy', 'Seq', 'Rule Name', 'Action', 'Source', 'Destination', 'Services', 'Profiles', 'Dir', 'Log', 'Disabled', 'Log Prefix']
     ws.append(headers)
     for cell in ws[1]:
         cell.font = hdr_font_white
         cell.fill = hdr_fill
         cell.alignment = Alignment(horizontal='center', vertical='center')
     ws.freeze_panes = 'A2'
-    ws.auto_filter.ref = f"A1:L{len(excel_rows) + 1}"
+    ws.auto_filter.ref = f"A1:M{len(excel_rows) + 1}"
 
     last_policy = ""
     for r in excel_rows:
         # Policy separator row
         if r["policy"] != last_policy:
             last_policy = r["policy"]
-            sep_row = [r["cat"], r["policy"], "", "", "", "", "", "", "", "", "", ""]
+            sep_row = [r["cat"], r["policy"], "", "", "", "", "", "", "", "", "", "", ""]
             ws.append(sep_row)
             row_num = ws.max_row
             for cell in ws[row_num]:
@@ -1005,7 +1114,7 @@ def _build_xlsx_base64(excel_rows, title):
         # Data row
         row_data = [
             r["cat"], r["policy"], r["seq"], r["name"], r["action"],
-            r["src"], r["dst"], r["svc"], r["dir"],
+            r["src"], r["dst"], r["svc"], r.get("profiles", "ANY"), r["dir"],
             "Yes" if r["logged"] else "No",
             "Yes" if r["disabled"] else "No",
             r["log_prefix"],
@@ -1030,7 +1139,7 @@ def _build_xlsx_base64(excel_rows, title):
             cell.border = thin_border
             cell.alignment = Alignment(vertical='top', wrap_text=bool(cell.value and '\n' in str(cell.value)))
 
-        # Add comments with group details to Source (F) and Destination (G)
+        # Add comments with group details to Source (F), Destination (G), Services (H)
         src_comment = r.get("src_comment", "")
         dst_comment = r.get("dst_comment", "")
         if src_comment:
@@ -1075,9 +1184,10 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
         "Environment": "#10b981", "Application": "#3b82f6",
     }
 
-    # Collect referenced groups/services
+    # Collect referenced groups/services/profiles
     referenced_groups = set()
     referenced_services = set()
+    referenced_profiles = set()
     for rlist in rules_by_policy.values():
         for r in rlist:
             for path in r.get("source_groups", []):
@@ -1092,6 +1202,9 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
             for path in r.get("services", []):
                 if path != "ANY":
                     referenced_services.add(path)
+            for path in r.get("profiles", []):
+                if path != "ANY":
+                    referenced_profiles.add(path)
     # Also from policy scope
     for p in sum(ordered_categories.values(), []):
         for path in p.get("scope", []):
@@ -1226,7 +1339,7 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
                 content_html += '  <div class="rules-table-wrap">\n'
                 content_html += '  <table class="rules-table">\n'
                 content_html += '    <thead><tr>\n'
-                content_html += '      <th>Seq</th><th>Name</th><th>Action</th><th>Source</th><th>Destination</th><th>Services</th><th>Dir</th><th>Flags</th><th>Log Prefix</th>\n'
+                content_html += '      <th>Seq</th><th>Name</th><th>Action</th><th>Source</th><th>Destination</th><th>Services</th><th>Profiles</th><th>Dir</th><th>Flags</th><th>Log Prefix</th>\n'
                 content_html += '    </tr></thead>\n'
                 content_html += '    <tbody>\n'
 
@@ -1256,6 +1369,7 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
                     content_html += f'      <td class="col-src">{format_groups(r.get("source_groups", ["ANY"]), groups_db, vm_db)}</td>\n'
                     content_html += f'      <td class="col-dst">{format_groups(r.get("destination_groups", ["ANY"]), groups_db, vm_db)}</td>\n'
                     content_html += f'      <td class="col-svc">{format_services(r.get("services", ["ANY"]), services_db)}</td>\n'
+                    content_html += f'      <td class="col-profile">{format_profiles(r.get("profiles", ["ANY"]), profiles_db)}</td>\n'
                     content_html += f'      <td class="col-dir">{_esc(r.get("direction", ""))}</td>\n'
                     content_html += f'      <td class="col-flags">{"".join(flags)}</td>\n'
                     log_prefix = r.get("tag", "") or r.get("log_label", "")
@@ -1280,6 +1394,7 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
                         "dst_comment": _format_groups_comment(dst_groups, groups_db, vm_db),
                         "svc": _format_services_text(r.get("services", ["ANY"]), services_db),
                         "svc_comment": _format_services_comment(r.get("services", ["ANY"]), services_db),
+                        "profiles": _format_profiles_text(r.get("profiles", ["ANY"]), profiles_db),
                         "dir": r.get("direction", ""),
                         "logged": logged,
                         "disabled": disabled,
@@ -1336,10 +1451,19 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
         display_vm_db = {eid: vm for eid, vm in display_vm_db.items()
                          if vm.get("display_name", "").lower() in vm_name_set}
 
+    # Pre-calculate display_profiles for nav/inventory
+    user_profiles_db = {p: pr for p, pr in profiles_db.items() if not pr.get("_system_owned")}
+    if has_filter:
+        display_profiles = {p: pr for p, pr in profiles_db.items() if p in referenced_profiles}
+    else:
+        display_profiles = profiles_db
+
     groups_nav += '<div class="nav-category" style="--cat-color: #a78bfa">\n'
     groups_nav += '  <div class="nav-cat-label">Inventory</div>\n'
     groups_nav += f'  <a class="nav-policy" href="#groups-inventory">Groups ({len(display_groups)})</a>\n'
     groups_nav += f'  <a class="nav-policy" href="#services-inventory">Services ({len(display_services)})</a>\n'
+    if display_profiles:
+        groups_nav += f'  <a class="nav-policy" href="#profiles-inventory">Profiles ({len(display_profiles)})</a>\n'
     if vm_db:
         if has_filter:
             groups_nav += f'  <a class="nav-policy" href="#vm-inventory">VMs ({len(display_vm_db)} filtered)</a>\n'
@@ -1359,6 +1483,7 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
     groups_section += '  </div>\n'
     groups_section += '  <div class="filter-bar">\n'
     groups_section += '    <input type="text" id="groupSearchInput" placeholder="Filter groups..." oninput="filterGroups()" />\n'
+    groups_section += '    <span id="groupSearchInputCount" class="search-count"></span>\n'
     groups_section += '    <button class="filter-btn" id="btnShowUnused" onclick="toggleUnused(this)">Hide unused</button>\n'
     groups_section += '  </div>\n'
     groups_section += '  <div class="rules-table-wrap">\n'
@@ -1409,6 +1534,7 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
     services_section += '  </div>\n'
     services_section += '  <div class="filter-bar">\n'
     services_section += '    <input type="text" id="svcSearchInput" placeholder="Filter services..." oninput="filterServices()" />\n'
+    services_section += '    <span id="svcSearchInputCount" class="search-count"></span>\n'
     services_section += '  </div>\n'
     services_section += '  <div class="rules-table-wrap">\n'
     services_section += '  <table class="rules-table" id="servicesTable">\n'
@@ -1431,6 +1557,61 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
         services_section += f'    </tr>\n'
 
     services_section += '    </tbody></table></div></div>\n'
+
+    # ─── Context Profiles Inventory ───
+    profiles_section = ""
+    if display_profiles:
+        ref_prof_count = len(referenced_profiles & set(profiles_db.keys()))
+        profiles_section += '<div class="category-section" id="profiles-inventory">\n'
+        profiles_section += '  <div class="category-header" style="--cat-color: #fbbf24">\n'
+        profiles_section += '    <span class="cat-dot" style="background: #fbbf24"></span>\n'
+        profiles_section += f'    <h2>Context Profiles</h2>\n'
+        if has_filter:
+            profiles_section += f'    <span class="cat-count">{len(display_profiles)} profiles (filtered)</span>\n'
+        else:
+            profiles_section += f'    <span class="cat-count">{len(user_profiles_db)} user-defined, {len(profiles_db) - len(user_profiles_db)} system ({ref_prof_count} used in rules)</span>\n'
+        profiles_section += '  </div>\n'
+        profiles_section += '  <div class="filter-bar">\n'
+        profiles_section += '    <input type="text" id="profSearchInput" placeholder="Filter profiles..." oninput="filterProfiles()" />\n'
+        profiles_section += '    <span id="profSearchInputCount" class="search-count"></span>\n'
+        profiles_section += '    <button class="filter-btn" id="btnShowUnusedProf" onclick="toggleUnusedProf(this)">Hide unused</button>\n'
+        profiles_section += '  </div>\n'
+        profiles_section += '  <div class="rules-table-wrap">\n'
+        profiles_section += '  <table class="rules-table" id="profilesTable">\n'
+        profiles_section += '    <thead><tr><th>Name</th><th>Type</th><th>Attributes</th><th>Rules</th></tr></thead>\n'
+        profiles_section += '    <tbody>\n'
+
+        for p_path in sorted(display_profiles.keys(), key=lambda p: display_profiles[p]["display_name"].lower()):
+            prof = display_profiles[p_path]
+            is_sys = prof.get("_system_owned", False)
+            is_used = p_path in referenced_profiles
+            used_cls = "" if is_used else "group-unused"
+            badge = ' <span class="svc-badge-sys">NSX</span>' if is_sys else ""
+
+            # Format attributes
+            attrs = prof.get("attributes", [])
+            attr_parts = []
+            for attr in attrs:
+                key = attr.get("key", "")
+                values = attr.get("values", [])
+                if key == "DOMAIN_NAME" and values:
+                    attr_parts.append(f'<span class="cond-badge">DOMAIN_NAME</span> ')
+                    attr_parts.append(", ".join(_esc(v) for v in values))
+                elif key and values:
+                    attr_parts.append(f'<span class="cond-badge">{_esc(key)}</span> {", ".join(_esc(v) for v in values[:10])}')
+            attr_html = " ".join(attr_parts) if attr_parts else '<span class="detail-empty">L7 protocol detection</span>'
+
+            # Count rule references
+            rule_ref = sum(1 for rlist in rules_by_policy.values() for r in rlist if p_path in r.get("profiles", []))
+
+            profiles_section += f'    <tr class="{used_cls}" id="prof-{_esc(prof["id"])}">\n'
+            profiles_section += f'      <td class="col-name">{_esc(prof["display_name"])}{badge}</td>\n'
+            profiles_section += f'      <td>{"System" if is_sys else "Custom"}</td>\n'
+            profiles_section += f'      <td class="group-members-cell">{attr_html}</td>\n'
+            profiles_section += f'      <td class="col-seq">{rule_ref}</td>\n'
+            profiles_section += f'    </tr>\n'
+
+        profiles_section += '    </tbody></table></div></div>\n'
 
     vm_section = _build_vm_section(display_vm_db, groups_db, is_filtered=has_filter, total_vms=len(vm_db) if vm_db else 0)
 
@@ -1576,6 +1757,13 @@ body {{ font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; background
 .svc-enriched {{ display: inline-block; margin: 2px 0; }}
 .svc-ports {{ display: block; font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; font-size: 10px; color: var(--green); line-height: 1.4; }}
 
+.profile-enriched {{ display: inline-block; margin: 2px 0; }}
+.profile-link {{ font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; font-size: 11px; color: var(--amber); text-decoration: none; border-bottom: 1px dotted rgba(251,191,36,0.4); cursor: pointer; }}
+.profile-link:hover {{ color: var(--text-bright); border-bottom-color: var(--text-bright); }}
+.profile-link.profile-sys {{ color: var(--text-dim); border-bottom: 1px dotted rgba(139,144,160,0.3); }}
+.profile-link.profile-sys:hover {{ color: var(--text-bright); border-bottom-color: var(--text-bright); }}
+.profile-detail {{ display: block; font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; font-size: 9px; color: var(--text-dim); line-height: 1.4; max-width: 300px; word-break: break-all; }}
+
 .groups-table td {{ max-width: 400px; }}
 .group-members-cell {{ font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; font-size: 11px; line-height: 1.6; max-width: 500px; word-break: break-word; }}
 tr.group-unused {{ opacity: 0.4; }}
@@ -1590,6 +1778,8 @@ tr.group-unused:hover {{ opacity: 0.8; }}
 
 @media (max-width: 900px) {{ .sidebar {{ display: none; }} .main {{ margin-left: 0; padding: 20px; }} }}
 @media print {{ .sidebar {{ display: none; }} .main {{ margin-left: 0; }} .filter-bar {{ display: none; }} .policy-card {{ break-inside: avoid; }} }}
+mark.hl {{ background: rgba(251,191,36,0.35); color: inherit; padding: 0 1px; border-radius: 2px; }}
+.search-count {{ font-size: 11px; color: var(--text-dim); font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; min-width: 60px; }}
 </style>
 </head>
 <body>
@@ -1621,6 +1811,7 @@ tr.group-unused:hover {{ opacity: 0.8; }}
 
   <div class="filter-bar">
     <input type="text" id="searchInput" placeholder="Search rules, policies, groups..." oninput="filterContent()" />
+    <span id="searchCount" class="search-count"></span>
     <button class="filter-btn" onclick="toggleWcp(this)">Hide Kubernetes</button>
     <button class="filter-btn" onclick="toggleDisabled(this)">Hide disabled</button>
     {'<button class="filter-btn" onclick="exportExcel()" title="Export rules to Excel (.xlsx)">Export Excel</button>' if excel_mode == 'xlsx' else '<button class="filter-btn" disabled style="opacity:0.3;cursor:not-allowed" title="openpyxl not installed — run: pip install openpyxl">Export Excel (N/A)</button>'}
@@ -1629,6 +1820,7 @@ tr.group-unused:hover {{ opacity: 0.8; }}
   {content_html}
   {groups_section}
   {services_section}
+  {profiles_section}
   {vm_section}
 </main>
 
@@ -1645,8 +1837,43 @@ tr.group-unused:hover {{ opacity: 0.8; }}
   window.addEventListener('resize',adj);
 }})();
 let hideWcp=false, hideDisabled=false, hideUnused=false;
+function _clearHL(el){{
+  el.querySelectorAll('mark.hl').forEach(m=>{{
+    const p=m.parentNode;
+    p.replaceChild(document.createTextNode(m.textContent),m);
+    p.normalize();
+  }});
+}}
+function _addHL(el,q){{
+  if(!q)return;
+  const ql=q.toLowerCase();
+  const walk=document.createTreeWalker(el,NodeFilter.SHOW_TEXT,null);
+  const hits=[];
+  let n;
+  while(n=walk.nextNode()){{
+    if(n.parentNode.tagName==='MARK'||n.parentNode.tagName==='SCRIPT'||n.parentNode.tagName==='STYLE')continue;
+    const idx=n.textContent.toLowerCase().indexOf(ql);
+    if(idx>=0)hits.push({{node:n,idx:idx}});
+  }}
+  hits.forEach(h=>{{
+    const t=h.node;
+    const before=t.textContent.substring(0,h.idx);
+    const match=t.textContent.substring(h.idx,h.idx+q.length);
+    const after=t.textContent.substring(h.idx+q.length);
+    const mark=document.createElement('mark');
+    mark.className='hl';
+    mark.textContent=match;
+    const frag=document.createDocumentFragment();
+    if(before)frag.appendChild(document.createTextNode(before));
+    frag.appendChild(mark);
+    if(after)frag.appendChild(document.createTextNode(after));
+    t.parentNode.replaceChild(frag,t);
+  }});
+}}
 function filterContent() {{
   const q=document.getElementById('searchInput').value.toLowerCase();
+  const main=document.querySelector('.main');
+  _clearHL(main);
   document.querySelectorAll('.policy-card').forEach(card=>{{
     const text=card.textContent.toLowerCase();
     const matchesSearch=!q||text.includes(q);
@@ -1656,36 +1883,40 @@ function filterContent() {{
     if(show&&hideDisabled) card.querySelectorAll('tr.rule-disabled').forEach(r=>r.style.display='none');
     else if(show) card.querySelectorAll('tr.rule-disabled').forEach(r=>r.style.display='');
   }});
+  if(q){{
+    let cnt=0;
+    document.querySelectorAll('.policy-card').forEach(card=>{{
+      if(card.style.display!=='none'){{_addHL(card,q);cnt++;}};
+    }});
+    document.getElementById('searchCount').textContent=cnt+' match'+(cnt!==1?'es':'');
+  }}else{{document.getElementById('searchCount').textContent='';}}
 }}
 function toggleWcp(btn) {{ hideWcp=!hideWcp; btn.classList.toggle('active',hideWcp); filterContent(); }}
 function toggleDisabled(btn) {{ hideDisabled=!hideDisabled; btn.classList.toggle('active',hideDisabled); filterContent(); }}
-function filterGroups() {{
-  const q=(document.getElementById('groupSearchInput')||{{}}).value||'';
+function _filterTable(inputId,tableId,unusedFlag){{
+  const q=(document.getElementById(inputId)||{{}}).value||'';
   const ql=q.toLowerCase();
-  const table=document.getElementById('groupsTable');
+  const table=document.getElementById(tableId);
   if(!table)return;
+  _clearHL(table);
+  let cnt=0;
   table.querySelectorAll('tbody tr').forEach(row=>{{
     const text=row.textContent.toLowerCase();
     const isUnused=row.classList.contains('group-unused');
-    row.style.display=(!ql||text.includes(ql))&&!(hideUnused&&isUnused)?'':'none';
+    const show=(!ql||text.includes(ql))&&!(unusedFlag&&isUnused);
+    row.style.display=show?'':'none';
+    if(show&&ql){{_addHL(row,q);cnt++;}};
   }});
+  const cEl=document.getElementById(inputId+'Count');
+  if(cEl)cEl.textContent=ql?(cnt+' match'+(cnt!==1?'es':'')):'';
 }}
+function filterGroups() {{ _filterTable('groupSearchInput','groupsTable',hideUnused); }}
 function toggleUnused(btn) {{ hideUnused=!hideUnused; btn.classList.toggle('active',hideUnused); filterGroups(); }}
-function filterVMs(){{
-  var q=document.getElementById('vmSearchInput').value.toLowerCase();
-  document.querySelectorAll('#vmTable tbody tr').forEach(function(tr){{
-    tr.style.display=tr.textContent.toLowerCase().includes(q)?'':'none';
-  }});
-}}
-function filterServices() {{
-  const q=(document.getElementById('svcSearchInput')||{{}}).value||'';
-  const ql=q.toLowerCase();
-  const table=document.getElementById('servicesTable');
-  if(!table)return;
-  table.querySelectorAll('tbody tr').forEach(row=>{{
-    row.style.display=(!ql||row.textContent.toLowerCase().includes(ql))?'':'none';
-  }});
-}}
+function filterVMs() {{ _filterTable('vmSearchInput','vmTable',false); }}
+function filterServices() {{ _filterTable('svcSearchInput','servicesTable',false); }}
+let hideUnusedProf=false;
+function filterProfiles() {{ _filterTable('profSearchInput','profilesTable',hideUnusedProf); }}
+function toggleUnusedProf(btn) {{ hideUnusedProf=!hideUnusedProf; btn.classList.toggle('active',hideUnusedProf); filterProfiles(); }}
 </script>
 <script>
 var _xlsData={excel_data_json};
