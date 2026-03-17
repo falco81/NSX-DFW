@@ -661,7 +661,7 @@ def render_group_members_html(members, vm_db=None):
                         ip_suffix = f' [{", ".join(vm_ips)}]' if vm_ips else ""
                         vm_names.append(f'<a href="#vm-{_esc(eid)}" class="vm-link" title="{_esc(vm["display_name"])}{_esc(ip_suffix)}">{_esc(vm["display_name"])}{_esc(ip_suffix)}</a>')
                     else:
-                        vm_names.append(f'<span class="vm-name" title="{_esc(eid)}">{_esc(eid[:13])}\u2026</span>')
+                        vm_names.append(f'<span class="vm-name" title="{_esc(eid)}">{_esc(eid)}</span>')
                 parts.append(", ".join(vm_names))
             else:
                 parts.append(f'{_esc(m["member_type"])} &times;{m["count"]}')
@@ -703,7 +703,7 @@ def _format_group_detail(g, vm_db=None):
                 if eid in vm_db:
                     vm_names.append(vm_db[eid]["display_name"])
                 else:
-                    vm_names.append(eid[:12] + "\u2026")
+                    vm_names.append(eid)
         elif m["type"] == "condition":
             conditions.append(f'{m["member_type"]} {m["key"]} {m["operator"]} {m["value"]}')
         elif m["type"] == "conjunction":
@@ -733,7 +733,7 @@ def _format_group_detail(g, vm_db=None):
                     else:
                         enriched.append(vm["display_name"])
                 else:
-                    enriched.append(eid[:12] + "\u2026")
+                    enriched.append(eid)
         return ", ".join(enriched) if enriched else ", ".join(vm_names)
     elif conditions:
         return " ".join(conditions)
@@ -866,7 +866,7 @@ def format_profiles(profile_paths, profiles_db):
                 if key == "DOMAIN_NAME" and values:
                     detail_parts.extend(values)
                 elif key and values:
-                    detail_parts.append(f'{key}: {", ".join(values[:5])}')
+                    detail_parts.append(f'{key}: {", ".join(values)}')
             detail_html = ""
             if detail_parts:
                 detail_html = '<span class="profile-detail">' + ", ".join(_esc(d) for d in detail_parts) + '</span>'
@@ -1167,7 +1167,7 @@ def _build_xlsx_base64(excel_rows, title):
 
 
 def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
-                  groups_db, services_db, profiles_db, vm_db=None, filter_text=None, filter_tag=None, filter_vm=None):
+                  groups_db, services_db, profiles_db, vm_db=None, filter_text=None, filter_tag=None, filter_vm=None, filter_category=None):
 
     total_policies = sum(len(v) for v in ordered_categories.values())
     total_rules = sum(len(v) for v in rules_by_policy.values())
@@ -1251,7 +1251,7 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
 
     # Collect referenced VMs (from groups that are in the filtered set)
     referenced_vms = set()
-    has_filter = bool(filter_text or filter_tag or filter_vm)
+    has_filter = bool(filter_text or filter_tag or filter_vm or filter_category)
     if has_filter and vm_db:
         for gpath in referenced_groups:
             g = groups_db.get(gpath)
@@ -1598,7 +1598,7 @@ def generate_html(ordered_categories, rules_by_policy, policy_map, output_path,
                     attr_parts.append(f'<span class="cond-badge">DOMAIN_NAME</span> ')
                     attr_parts.append(", ".join(_esc(v) for v in values))
                 elif key and values:
-                    attr_parts.append(f'<span class="cond-badge">{_esc(key)}</span> {", ".join(_esc(v) for v in values[:10])}')
+                    attr_parts.append(f'<span class="cond-badge">{_esc(key)}</span> {", ".join(_esc(v) for v in values)}')
             attr_html = " ".join(attr_parts) if attr_parts else '<span class="detail-empty">L7 protocol detection</span>'
 
             # Count rule references
@@ -2222,20 +2222,22 @@ def print_usage():
     print("""NSX DFW Documentation Generator
 
 Usage:
-  nsx_dfw_doc.py fetch [output.json] [output.html] [--filter TEXT] [--filter-tag TAG] [--filter-vm VM,...]
+  nsx_dfw_doc.py fetch [output.json] [output.html] [--filter TEXT] [--filter-tag TAG] [--filter-vm VM,...] [--filter-category CAT,...]
       Fetch DFW objects + VM inventory and generate HTML.
 
-  nsx_dfw_doc.py <input.json> [output.html] [--filter TEXT] [--filter-tag TAG] [--filter-vm VM,...]
+  nsx_dfw_doc.py <input.json> [output.html] [--filter TEXT] [--filter-tag TAG] [--filter-vm VM,...] [--filter-category CAT,...]
       Generate HTML from previously fetched JSON.
 
-  --filter TEXT        Match policy names, group names, condition values,
-                       effective VM names (STARTSWITH/ENDSWITH/etc.), rule tags.
-  --filter-tag TAG     Match NSX tag scope/value (colon = AND logic):
-                         --filter-tag Z00:Prod
-  --filter-vm VM,...   Comma-separated VM display names. Only rules whose
-                       groups contain these VMs are included.
-                       Case-insensitive exact match on VM display_name.
-  All filters can be combined. Case-insensitive.
+  --filter TEXT           Match policy names, group names, condition values,
+                          effective VM names (STARTSWITH/ENDSWITH/etc.), rule tags.
+  --filter-tag TAG        Match NSX tag scope/value (colon = AND logic):
+                            --filter-tag Z00:Prod
+  --filter-vm VM,...      Comma-separated VM display names. Only rules whose
+                          groups contain these VMs are included.
+                          Case-insensitive exact match on VM display_name.
+  --filter-category CAT,. Filter by DFW category (comma-separated):
+                          Ethernet, Emergency, Infrastructure, Environment, Application
+  All filters can be combined. Category filter is applied first, then others.
 
 Examples:
   nsx_dfw_doc.py fetch
@@ -2244,7 +2246,8 @@ Examples:
   nsx_dfw_doc.py dfw_objects.json --filter-tag Z00
   nsx_dfw_doc.py dfw_objects.json --filter-tag Z00:Prod
   nsx_dfw_doc.py dfw_objects.json --filter-vm srv01.example.cz,srv02.example.cz
-  nsx_dfw_doc.py dfw_objects.json --filter xdc --filter-tag Z00
+  nsx_dfw_doc.py dfw_objects.json --filter-category "Emergency,Infrastructure"
+  nsx_dfw_doc.py dfw_objects.json --filter-category Infrastructure --filter-tag Z00:Prod
   nsx_dfw_doc.py fetch --filter WSA04""")
 
 
@@ -2255,10 +2258,11 @@ def main():
 
     args = sys.argv[1:]
 
-    # Extract --filter, --filter-tag, and --filter-vm arguments
+    # Extract --filter, --filter-tag, --filter-vm, and --filter-category arguments
     filter_text = None
     filter_tag = None
     filter_vm = None
+    filter_category = None
     clean_args = []
     i = 0
     while i < len(args):
@@ -2270,6 +2274,9 @@ def main():
             i += 2
         elif args[i] == "--filter-vm" and i + 1 < len(args):
             filter_vm = args[i + 1]
+            i += 2
+        elif args[i] == "--filter-category" and i + 1 < len(args):
+            filter_category = args[i + 1]
             i += 2
         else:
             clean_args.append(args[i])
@@ -2303,6 +2310,8 @@ def main():
     if html_output is None:
         base = os.path.splitext(os.path.basename(json_file))[0]
         suffix_parts = []
+        if filter_category:
+            suffix_parts.append("cat-" + filter_category.replace(",", "-").lower())
         if filter_text:
             suffix_parts.append(filter_text)
         if filter_tag:
@@ -2319,6 +2328,28 @@ def main():
 
     ordered, rules_by_policy, policy_map, groups_db, services_db, profiles_db, vm_db = parse_json(json_file)
 
+    # Pre-filter by category (before other filters)
+    if filter_category:
+        cats = {c.strip().lower() for c in filter_category.split(",") if c.strip()}
+        before_pols = sum(len(v) for v in ordered.values())
+        new_ordered = OrderedDict()
+        new_rules = {}
+        new_pmap = {}
+        for cat, pols in ordered.items():
+            if cat.lower() in cats:
+                new_ordered[cat] = pols
+                for p in pols:
+                    sp = p.get("path", "")
+                    if sp in rules_by_policy:
+                        new_rules[sp] = rules_by_policy[sp]
+                    if sp in policy_map:
+                        new_pmap[sp] = policy_map[sp]
+        after_pols = sum(len(v) for v in new_ordered.values())
+        print(f"  Category filter '{filter_category}': {after_pols} policies (from {before_pols})")
+        ordered = new_ordered
+        rules_by_policy = new_rules
+        policy_map = new_pmap
+
     if filter_text or filter_tag or filter_vm:
         ordered, rules_by_policy, policy_map = filter_policies(
             ordered, rules_by_policy, policy_map, groups_db,
@@ -2326,6 +2357,8 @@ def main():
 
     filter_label = None
     label_parts = []
+    if filter_category:
+        label_parts.append(f"category:{filter_category}")
     if filter_text:
         label_parts.append(filter_text)
     if filter_tag:
@@ -2335,7 +2368,7 @@ def main():
     if label_parts:
         filter_label = " + ".join(label_parts)
 
-    generate_html(ordered, rules_by_policy, policy_map, html_output, groups_db, services_db, profiles_db, vm_db=vm_db, filter_text=filter_label, filter_tag=filter_tag, filter_vm=filter_vm)
+    generate_html(ordered, rules_by_policy, policy_map, html_output, groups_db, services_db, profiles_db, vm_db=vm_db, filter_text=filter_label, filter_tag=filter_tag, filter_vm=filter_vm, filter_category=filter_category)
 
 
 if __name__ == "__main__":
