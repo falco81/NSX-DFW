@@ -25,7 +25,6 @@ import re
 import socket
 import sys
 import tarfile
-import tempfile
 import time
 from collections import Counter
 from pathlib import Path
@@ -34,9 +33,9 @@ from pathlib import Path
 # CONFIGURATION
 # =============================================================================
 
-DNS_SERVER     = "1.1.1.1"    # Primary DNS for PTR lookups
-DNS_SERVER2    = "2.2.2.2"    # Secondary DNS for PTR lookups
-DNS_SERVER3    = "3.3.3.3"    # Tertiary DNS for PTR lookups
+DNS_SERVER     = "10.12.254.11"    # Primary DNS for PTR lookups
+DNS_SERVER2    = "10.12.255.101"   # Secondary DNS for PTR lookups
+DNS_SERVER3    = ""                # Tertiary DNS for PTR lookups
 DNS_TIMEOUT    = 2
 DNS_CACHE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), ".dns_ptr_cache.json"
@@ -671,33 +670,40 @@ def parse_text(text: str) -> tuple:
 # Archive extraction
 # =============================================================================
 
-def extract_csvs(path: str, tmpdir: str) -> list:
-    out = []
+def iter_csvs_from_tar(path: str):
+    """Yield (filename, text_stream) for each CSV inside a tar.gz — no disk extraction."""
+    import io
     with tarfile.open(path, "r:gz") as tar:
-        for m in tar.getmembers():
+        for m in tar:
             if m.name.lower().endswith(".csv") and m.isfile():
-                try:
-                    tar.extract(m, path=tmpdir, filter='data')
-                except TypeError:
-                    # Python < 3.12 doesn't support filter=
-                    tar.extract(m, path=tmpdir)
-                out.append(os.path.join(tmpdir, m.name))
-    return sorted(out)
+                f = tar.extractfile(m)
+                if f is not None:
+                    text = f.read().decode("utf-8", errors="replace")
+                    yield os.path.basename(m.name), io.StringIO(text)
 
 
-# =============================================================================
-# Core processing
-# =============================================================================
+def process(csv_sources, mode, ex_ips, ex_ports, act_filter, dir_filter):
+    """Process CSV sources.
 
-def process(csv_files, mode, ex_ips, ex_ports, act_filter, dir_filter):
+    csv_sources: iterable of either
+      - str  (file path — opened from disk)
+      - (str, file-like)  (name + already-open text stream)
+    """
     recs = {}
     all_ips = set()
     total = skip = dupes = 0
 
-    for csv_file in csv_files:
-        fn = os.path.basename(csv_file)
+    for src in csv_sources:
+        if isinstance(src, str):
+            fn = os.path.basename(src)
+            fh = open(src, "r", encoding="utf-8", errors="replace")
+            close_after = True
+        else:
+            fn, fh = src
+            close_after = False
+
         frows = 0
-        with open(csv_file, "r", encoding="utf-8", errors="replace") as fh:
+        try:
             rd = csv.DictReader(fh)
             if not rd.fieldnames or COL_SRC_IP not in rd.fieldnames:
                 print(f"  [SKIP] {fn}: missing required columns", file=sys.stderr)
@@ -752,6 +758,9 @@ def process(csv_files, mode, ex_ips, ex_ports, act_filter, dir_filter):
 
                 if total % PROGRESS_EVERY == 0:
                     print(f"  ... {total:,} rows, {len(recs):,} unique", file=sys.stderr)
+        finally:
+            if close_after:
+                fh.close()
 
         print(f"  [{fn}] {frows:,} rows", file=sys.stderr)
 
@@ -2019,45 +2028,45 @@ def main():
     t0 = time.time()
     # Load GeoIP database if available (optional, for HTML country flags)
     load_geoip()
-    with tempfile.TemporaryDirectory(prefix="nsxt_") as tmp:
-        inp = args.input
-        if inp.lower().endswith(".csv"):
-            print("[1/4] Reading CSV file directly...", file=sys.stderr)
-            csvs = [inp]
-            print(f"  Input: {os.path.basename(inp)}\n", file=sys.stderr)
-        else:
-            print("[1/4] Extracting CSVs...", file=sys.stderr)
-            csvs = extract_csvs(inp, tmp)
-            print(f"  Found {len(csvs)} CSV files\n", file=sys.stderr)
-        if not csvs:
-            print("Error: No CSVs found!", file=sys.stderr); sys.exit(1)
 
-        print("[2/4] Processing & deduplicating...", file=sys.stderr)
-        recs, ips = process(csvs, args.mode, ex_ips, ex_ports,
-                            args.action.upper() if args.action else None,
-                            args.direction.upper() if args.direction else None)
-        if not recs:
-            print("\nNo records match.", file=sys.stderr); sys.exit(0)
+    inp = args.input
+    if inp.lower().endswith(".csv"):
+        print("[1/4] Reading CSV file directly...", file=sys.stderr)
+        csv_sources = [inp]
+        print(f"  Input: {os.path.basename(inp)}\n", file=sys.stderr)
+    else:
+        print("[1/4] Streaming CSVs from archive...", file=sys.stderr)
+        csv_sources = list(iter_csvs_from_tar(inp))
+        print(f"  Found {len(csv_sources)} CSV files\n", file=sys.stderr)
+    if not csv_sources:
+        print("Error: No CSVs found!", file=sys.stderr); sys.exit(1)
 
-        dns_map = None
-        if args.resolve_dns:
-            print("\n[3/4] DNS PTR resolution...", file=sys.stderr)
-            dc = DnsCache(args.dns_cache_file, args.dns_server,
-                          args.dns_server2, args.dns_server3)
-            dns_map = resolve_all(ips, dc)
-        else:
-            print("\n[3/4] DNS skipped (--resolve-dns to enable)", file=sys.stderr)
+    print("[2/4] Processing & deduplicating...", file=sys.stderr)
+    recs, ips = process(csv_sources, args.mode, ex_ips, ex_ports,
+                        args.action.upper() if args.action else None,
+                        args.direction.upper() if args.direction else None)
+    if not recs:
+        print("\nNo records match.", file=sys.stderr); sys.exit(0)
 
-        print(f"\n[4/4] Writing output...", file=sys.stderr)
-        translate = not args.no_translate
-        if args.html:
-            write_html(recs, args.output, dns_map, args.sort_by,
-                       translate=translate)
-        else:
-            write_csv(recs, args.output, dns_map, args.sort_by,
-                      translate=translate)
-        if args.stats:
-            stats(recs)
+    dns_map = None
+    if args.resolve_dns:
+        print("\n[3/4] DNS PTR resolution...", file=sys.stderr)
+        dc = DnsCache(args.dns_cache_file, args.dns_server,
+                      args.dns_server2, args.dns_server3)
+        dns_map = resolve_all(ips, dc)
+    else:
+        print("\n[3/4] DNS skipped (--resolve-dns to enable)", file=sys.stderr)
+
+    print(f"\n[4/4] Writing output...", file=sys.stderr)
+    translate = not args.no_translate
+    if args.html:
+        write_html(recs, args.output, dns_map, args.sort_by,
+                   translate=translate)
+    else:
+        write_csv(recs, args.output, dns_map, args.sort_by,
+                  translate=translate)
+    if args.stats:
+        stats(recs)
 
     print(f"\nDone in {time.time()-t0:.1f}s", file=sys.stderr)
 
