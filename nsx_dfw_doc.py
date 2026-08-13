@@ -518,6 +518,7 @@ def _parse_domain(domain_obj, policies, rules_by_policy, groups):
                         "tag": r.get("tag", ""),
                         "log_label": r.get("log_label", ""),
                         "profiles": r.get("profiles", ["ANY"]),
+                        "rule_id": r.get("rule_id"),
                     })
 
 
@@ -2218,6 +2219,82 @@ def filter_policies(ordered_categories, rules_by_policy, policy_map, groups_db,
     return filtered_ordered, filtered_rules, filtered_pmap
 
 
+def generate_log_filter(ordered, rules_by_policy, policy_map):
+    """Generate Log Insight / Aria Operations for Logs filter query from filtered rules."""
+    logged_rules = []
+    not_logged_rules = []
+
+    for cat, pols in ordered.items():
+        for pol in pols:
+            sp_path = pol.get("path", "")
+            pol_name = pol.get("display_name", "")
+            for r in rules_by_policy.get(sp_path, []):
+                if r.get("disabled"):
+                    continue
+                entry = {
+                    "rule_id": r.get("rule_id"),
+                    "display_name": r.get("display_name", ""),
+                    "action": r.get("action", ""),
+                    "tag": r.get("tag", ""),
+                    "log_label": r.get("log_label", ""),
+                    "policy": pol_name,
+                    "category": cat,
+                }
+                if r.get("logged"):
+                    logged_rules.append(entry)
+                else:
+                    not_logged_rules.append(entry)
+
+    # Header
+    print(f"\n{'='*70}")
+    print(f"  Log Insight Filter Query")
+    print(f"{'='*70}")
+    print(f"  Matched rules:    {len(logged_rules) + len(not_logged_rules)}")
+    print(f"  Logging enabled:  {len(logged_rules)}")
+    print(f"  Logging disabled: {len(not_logged_rules)}")
+
+    if not logged_rules:
+        print(f"\n  WARNING: No rules with logging enabled found in the filtered set.")
+        print(f"           Enable logging on the desired rules in NSX Manager first.")
+        print(f"{'='*70}")
+        return
+
+    # Build rule_id list
+    rule_ids = [str(r["rule_id"]) for r in logged_rules if r["rule_id"] is not None]
+
+    # Log Insight filter query
+    print(f"\n  ── Log Insight / Aria Operations for Logs ─────────────────────")
+    print(f"\n  Filter (paste into search bar):\n")
+    print(f'  vmw_nsx_firewall_rule_id IN ({", ".join(rule_ids)})')
+
+    print(f"\n  Alternative — individual rule filters:\n")
+    for r in logged_rules:
+        tag = f'  tag="{r["tag"]}"' if r["tag"] else ""
+        print(f'  vmw_nsx_firewall_rule_id={r["rule_id"]}  # {r["action"]:6s} {r["display_name"]}{tag}')
+
+    # Syslog grep pattern
+    print(f"\n  ── Syslog / grep ─────────────────────────────────────────────")
+    print(f"\n  grep -E '({'|'.join(rule_ids)})' /var/log/dfwpktlogs.log")
+
+    # Table of logged rules
+    print(f"\n  ── Rules with logging enabled ({len(logged_rules)}) ──────────────────────")
+    print(f"  {'RuleID':>8s}  {'Action':6s}  {'Category':14s}  {'Policy':30s}  Rule Name")
+    print(f"  {'─'*8}  {'─'*6}  {'─'*14}  {'─'*30}  {'─'*30}")
+    for r in logged_rules:
+        print(f"  {r['rule_id']:>8d}  {r['action']:6s}  {r['category']:14s}  {r['policy']:30s}  {r['display_name']}")
+
+    # Warn about rules without logging
+    if not_logged_rules:
+        print(f"\n  ── Rules WITHOUT logging ({len(not_logged_rules)}) ─ not in filter ────────")
+        print(f"  {'RuleID':>8s}  {'Action':6s}  {'Category':14s}  {'Policy':30s}  Rule Name")
+        print(f"  {'─'*8}  {'─'*6}  {'─'*14}  {'─'*30}  {'─'*30}")
+        for r in not_logged_rules:
+            rid = str(r['rule_id']) if r['rule_id'] is not None else '?'
+            print(f"  {rid:>8s}  {r['action']:6s}  {r['category']:14s}  {r['policy']:30s}  {r['display_name']}")
+
+    print(f"\n{'='*70}")
+
+
 def print_usage():
     print("""NSX DFW Documentation Generator
 
@@ -2237,6 +2314,7 @@ Usage:
                           Case-insensitive exact match on VM display_name.
   --filter-category CAT,. Filter by DFW category (comma-separated):
                           Ethernet, Emergency, Infrastructure, Environment, Application
+  --log-filter            Output Log Insight filter query for matched rules (CLI text, no HTML)
   All filters can be combined. Category filter is applied first, then others.
 
 Examples:
@@ -2248,6 +2326,7 @@ Examples:
   nsx_dfw_doc.py dfw_objects.json --filter-vm srv01.example.cz,srv02.example.cz
   nsx_dfw_doc.py dfw_objects.json --filter-category "Emergency,Infrastructure"
   nsx_dfw_doc.py dfw_objects.json --filter-category Infrastructure --filter-tag Z00:Prod
+  nsx_dfw_doc.py dfw_objects.json --filter-tag Z00:Prod --log-filter
   nsx_dfw_doc.py fetch --filter WSA04""")
 
 
@@ -2263,6 +2342,7 @@ def main():
     filter_tag = None
     filter_vm = None
     filter_category = None
+    log_filter_mode = False
     clean_args = []
     i = 0
     while i < len(args):
@@ -2278,6 +2358,9 @@ def main():
         elif args[i] == "--filter-category" and i + 1 < len(args):
             filter_category = args[i + 1]
             i += 2
+        elif args[i] == "--log-filter":
+            log_filter_mode = True
+            i += 1
         else:
             clean_args.append(args[i])
             i += 1
@@ -2354,6 +2437,11 @@ def main():
         ordered, rules_by_policy, policy_map = filter_policies(
             ordered, rules_by_policy, policy_map, groups_db,
             filter_text=filter_text, filter_tag=filter_tag, filter_vm=filter_vm, vm_db=vm_db)
+
+    # Log filter mode — output CLI text and exit
+    if log_filter_mode:
+        generate_log_filter(ordered, rules_by_policy, policy_map)
+        return
 
     filter_label = None
     label_parts = []
